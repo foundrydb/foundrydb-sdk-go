@@ -86,8 +86,10 @@ type DNSRecord struct {
 }
 
 // Service represents a managed database service returned by the API.
+// The API returns the identifier as "id"; see TestServiceWireFormat which
+// pins this tag so struct regenerations cannot silently regress it again.
 type Service struct {
-	ID                  string        `json:"uuid"`
+	ID                  string        `json:"id"`
 	Name                string        `json:"name"`
 	DatabaseType        DatabaseType  `json:"database_type"`
 	Version             string        `json:"version"`

@@ -573,3 +573,30 @@ func TestListServices_WithOrgID(t *testing.T) {
 		t.Errorf("expected X-Active-Org-ID=my-org-id, got %q", gotOrg)
 	}
 }
+
+// TestServiceWireFormat pins the JSON wire format of Service against the
+// actual API field names. The fixture is a raw JSON document, not a
+// marshalled Service, so a struct-tag regression fails here even though the
+// round-trip tests above keep passing. The "id" tag has regressed to "uuid"
+// once before when the struct was regenerated from a stale copy.
+func TestServiceWireFormat(t *testing.T) {
+	raw := []byte(`{
+		"id": "11111111-2222-3333-4444-555555555555",
+		"name": "wire-check",
+		"database_type": "postgresql",
+		"status": "Running",
+		"plan_name": "tier-2",
+		"storage_size_gb": 50
+	}`)
+
+	var svc Service
+	if err := json.Unmarshal(raw, &svc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if svc.ID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("Service.ID not parsed from the API's \"id\" field; got %q. The json tag has likely regressed.", svc.ID)
+	}
+	if svc.Name != "wire-check" {
+		t.Errorf("Service.Name = %q, want wire-check", svc.Name)
+	}
+}
