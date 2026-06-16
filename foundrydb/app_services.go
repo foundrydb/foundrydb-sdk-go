@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -609,6 +610,73 @@ func (c *Client) RevokeAppServiceAuthSession(ctx context.Context, appServiceID, 
 	}
 	_, err = checkResponse(resp)
 	return err
+}
+
+// DeleteAppServiceAuthUserRequest addresses the end-user to erase. Set exactly
+// one of Email or UserID.
+type DeleteAppServiceAuthUserRequest struct {
+	// Email addresses the end-user by email. Mutually exclusive with UserID.
+	Email string `json:"email,omitempty"`
+	// UserID addresses the end-user by their auth subject UUID. Mutually
+	// exclusive with Email.
+	UserID string `json:"user_id,omitempty"`
+}
+
+// DeleteAppServiceAuthUser erases one end-user under the GDPR right to erasure
+// (Art. 17), addressed by exactly one of Email or UserID. The erasure removes
+// the user and their identity data (identities, sessions, refresh tokens, MFA
+// enrolments, pending login/oauth tokens) and scrubs the user's audit-log
+// rows. It is dispatched asynchronously to the backing database's primary VM;
+// the returned task id is for status polling. The email is never persisted or
+// logged controller-side.
+func (c *Client) DeleteAppServiceAuthUser(ctx context.Context, appServiceID string, req DeleteAppServiceAuthUserRequest) (string, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/auth/users/delete", req, "")
+	if err != nil {
+		return "", err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("foundrydb: decode DeleteAppServiceAuthUser response: %w", err)
+	}
+	if result.TaskID == "" {
+		return "", fmt.Errorf("foundrydb: DeleteAppServiceAuthUser response missing task_id")
+	}
+	return result.TaskID, nil
+}
+
+// DeleteAppServiceAuthUserByIdentifier erases one end-user under the GDPR right
+// to erasure (Art. 17), addressed by a single path identifier that is either an
+// email address (contains '@') or a user UUID. It calls
+// DELETE /app-services/{id}/auth/users/{identifier} and returns the task id for
+// status polling. The identifier is percent-encoded before being placed in the
+// URL path so email addresses with '+' or other special characters are handled
+// correctly. The email is never persisted or logged controller-side.
+func (c *Client) DeleteAppServiceAuthUserByIdentifier(ctx context.Context, appServiceID, identifier string) (string, error) {
+	path := "/app-services/" + appServiceID + "/auth/users/" + url.PathEscape(identifier)
+	resp, err := c.do(ctx, http.MethodDelete, path, nil, "")
+	if err != nil {
+		return "", err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("foundrydb: decode DeleteAppServiceAuthUserByIdentifier response: %w", err)
+	}
+	if result.TaskID == "" {
+		return "", fmt.Errorf("foundrydb: DeleteAppServiceAuthUserByIdentifier response missing task_id")
+	}
+	return result.TaskID, nil
 }
 
 // WaitForAppRunning polls the app service until it reaches "Running" status or

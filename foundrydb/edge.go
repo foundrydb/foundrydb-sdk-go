@@ -77,9 +77,9 @@ type EdgeRateLimit struct {
 // EdgeSettingsRequest is the customer-tunable subset of the edge config.
 // Domains and origin are platform-derived and not settable here.
 type EdgeSettingsRequest struct {
-	CacheRules []EdgeCacheRule `json:"cache_rules,omitempty"`
-	RateLimit  *EdgeRateLimit  `json:"rate_limit,omitempty"`
-	WAFMode    *EdgeWAFMode    `json:"waf_mode,omitempty"`
+	CacheRules []EdgeCacheRule  `json:"cache_rules,omitempty"`
+	RateLimit  *EdgeRateLimit   `json:"rate_limit,omitempty"`
+	WAFMode    *EdgeWAFMode     `json:"waf_mode,omitempty"`
 }
 
 // EdgeApplicationStatusItem is one PoP's convergence state.
