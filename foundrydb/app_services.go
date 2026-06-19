@@ -679,6 +679,88 @@ func (c *Client) DeleteAppServiceAuthUserByIdentifier(ctx context.Context, appSe
 	return result.TaskID, nil
 }
 
+// UpsertAppServiceAuthProviderRequest is the body for UpsertAppServiceAuthProvider.
+// ClientSecret is write-only: it is stored in the platform secret store and
+// never returned by any response. DisplayName is optional and sets the button
+// label on the hosted login page (defaults to the provider name when omitted).
+type UpsertAppServiceAuthProviderRequest struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	DisplayName  string `json:"display_name,omitempty"`
+}
+
+// AuthIDPProvidersResponse is the response envelope for the provider management
+// endpoints. Providers carries the full list of configured social-login
+// providers for the app after the operation is applied, without secrets.
+type AuthIDPProvidersResponse struct {
+	Providers []AuthIDPProviderConfig `json:"providers"`
+}
+
+// ListAppServiceAuthProviders returns the configured social-login providers for
+// an app service without their secrets (provider id, client_id, and optional
+// display_name only). Returns an empty slice when no providers are configured.
+func (c *Client) ListAppServiceAuthProviders(ctx context.Context, appServiceID string) ([]AuthIDPProviderConfig, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/auth/providers", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result AuthIDPProvidersResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListAppServiceAuthProviders response: %w", err)
+	}
+	return result.Providers, nil
+}
+
+// UpsertAppServiceAuthProvider adds or updates one social-login provider for an
+// app service and returns the full list of configured providers after the
+// operation. The provider is the lowercase provider id ("google" or "github");
+// it is percent-encoded before being placed in the URL path. ClientSecret is
+// write-only: it is stored in the platform secret store and never returned.
+// When an Active auth configuration is updated, the issuer redeploys
+// automatically to pick up the new credentials.
+func (c *Client) UpsertAppServiceAuthProvider(ctx context.Context, appServiceID, provider string, req UpsertAppServiceAuthProviderRequest) ([]AuthIDPProviderConfig, error) {
+	path := "/app-services/" + appServiceID + "/auth/providers/" + url.PathEscape(provider)
+	resp, err := c.do(ctx, http.MethodPut, path, req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result AuthIDPProvidersResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode UpsertAppServiceAuthProvider response: %w", err)
+	}
+	return result.Providers, nil
+}
+
+// RemoveAppServiceAuthProvider removes one social-login provider from an app
+// service and returns the remaining configured providers. The provider id is
+// percent-encoded before being placed in the URL path. When an Active auth
+// configuration is updated, the issuer redeploys automatically; a non-Active
+// configuration picks up the change on its next deploy.
+func (c *Client) RemoveAppServiceAuthProvider(ctx context.Context, appServiceID, provider string) ([]AuthIDPProviderConfig, error) {
+	path := "/app-services/" + appServiceID + "/auth/providers/" + url.PathEscape(provider)
+	resp, err := c.do(ctx, http.MethodDelete, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result AuthIDPProvidersResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode RemoveAppServiceAuthProvider response: %w", err)
+	}
+	return result.Providers, nil
+}
+
 // WaitForAppRunning polls the app service until it reaches "Running" status or
 // the timeout expires. Polling interval is 10 seconds. The context deadline (if
 // any) takes precedence over timeout. Returns an error immediately when the
