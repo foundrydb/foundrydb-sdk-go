@@ -292,3 +292,276 @@ func (c *Client) WaitForStackRunning(ctx context.Context, id string, timeout tim
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: marketplace template management
+// ---------------------------------------------------------------------------
+
+// StackTemplateVisibility controls who can discover and launch a customer-authored template.
+type StackTemplateVisibility string
+
+const (
+	// StackTemplateVisibilityPrivate makes the template visible only to the creating user.
+	StackTemplateVisibilityPrivate StackTemplateVisibility = "private"
+	// StackTemplateVisibilityOrgShared makes the template visible to all members of the owning org.
+	StackTemplateVisibilityOrgShared StackTemplateVisibility = "org_shared"
+	// StackTemplateVisibilityPublic publishes the template to the marketplace (pending review).
+	StackTemplateVisibilityPublic StackTemplateVisibility = "public"
+)
+
+// CustomerStackTemplate is a customer-authored stack template stored in the platform catalog.
+// First-party templates returned by ListStackTemplates use StackTemplateSummary; this type is
+// for the writable, customer-owned variants managed via the Phase 2 marketplace API.
+type CustomerStackTemplate struct {
+	// ID is the server-assigned UUID for this template.
+	ID string `json:"id"`
+	// Name is the slug identifier for the template (URL-safe, unique within the owning org).
+	Name string `json:"name"`
+	// DisplayName is the human-readable title shown in the marketplace.
+	DisplayName string `json:"display_name"`
+	// Description is an optional long-form description shown on the template detail page.
+	Description string `json:"description"`
+	// Version is a caller-supplied semantic version string (e.g. "1.0.0").
+	Version string `json:"version"`
+	// Visibility controls who can discover and launch this template.
+	Visibility StackTemplateVisibility `json:"visibility"`
+	// Published marks whether the template is live in the marketplace. Only
+	// templates with Visibility=public and Published=true appear in the catalog.
+	Published bool `json:"published"`
+	// OrganizationID is the owning organization UUID.
+	OrganizationID string `json:"organization_id,omitempty"`
+	// Descriptor holds the raw YAML or JSON content of the stack descriptor
+	// as submitted via CreateStackTemplate. On read it is returned as-is.
+	Descriptor string `json:"descriptor,omitempty"`
+	// CostPreview is an optional server-computed cost estimate included when
+	// the server can evaluate the descriptor at list/get time.
+	CostPreview *StackCostPreview `json:"cost_preview,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+}
+
+// CreateStackTemplateRequest is the body for CreateStackTemplate (POST /stacks/templates).
+type CreateStackTemplateRequest struct {
+	// Name is a URL-safe slug for the template (required).
+	Name string `json:"name"`
+	// DisplayName is the human-readable title (required).
+	DisplayName string `json:"display_name"`
+	// Description is an optional long-form description.
+	Description string `json:"description,omitempty"`
+	// Version is a caller-supplied semver string (required, e.g. "1.0.0").
+	Version string `json:"version"`
+	// Visibility controls who can discover the template (default: private).
+	Visibility StackTemplateVisibility `json:"visibility,omitempty"`
+	// Descriptor is the raw YAML or JSON content of the stack descriptor (required).
+	Descriptor string `json:"descriptor"`
+}
+
+// StackUpgradeChangeItem describes one change that will be applied during an upgrade.
+type StackUpgradeChangeItem struct {
+	// Resource is the symbolic name of the resource being changed.
+	Resource string `json:"resource"`
+	// Field is the name of the field being changed (e.g. "plan_name", "version").
+	Field string `json:"field"`
+	// OldValue is the current value of the field (as a string representation).
+	OldValue string `json:"old_value"`
+	// NewValue is the value that will be set after the upgrade.
+	NewValue string `json:"new_value"`
+}
+
+// StackUpgradePreview is the result of PreviewStackUpgrade.
+type StackUpgradePreview struct {
+	// StackID is the stack this preview applies to.
+	StackID string `json:"stack_id"`
+	// TemplateName is the template that will be used for the upgrade.
+	TemplateName string `json:"template_name"`
+	// CurrentTemplateVersion is the version currently running on the stack.
+	CurrentTemplateVersion string `json:"current_template_version"`
+	// NewTemplateVersion is the version the stack will be upgraded to.
+	NewTemplateVersion string `json:"new_template_version"`
+	// Changes is the list of per-resource field changes this upgrade will apply.
+	Changes []StackUpgradeChangeItem `json:"changes"`
+	// CurrentMonthlyCost is the current estimated monthly cost for the stack.
+	CurrentMonthlyCost float64 `json:"current_monthly_cost"`
+	// NewMonthlyCost is the estimated monthly cost after the upgrade.
+	NewMonthlyCost float64 `json:"new_monthly_cost"`
+	// CostDelta is NewMonthlyCost minus CurrentMonthlyCost (negative = cheaper).
+	CostDelta float64 `json:"cost_delta"`
+	// Currency is the ISO 4217 code for all cost amounts.
+	Currency string `json:"currency"`
+}
+
+// ApplyStackUpgradeRequest is the body for ApplyStackUpgrade.
+type ApplyStackUpgradeRequest struct {
+	// AcceptedMonthlyCost is the new monthly cost previewed by PreviewStackUpgrade.
+	// Required; the upgrade is rejected if the freshly computed cost differs by more than $0.01.
+	AcceptedMonthlyCost float64 `json:"accepted_monthly_cost"`
+}
+
+type listCustomerTemplatesResponse struct {
+	Templates []CustomerStackTemplate `json:"templates"`
+}
+
+// CreateStackTemplate creates a new customer-authored stack template in the platform catalog.
+// The descriptor field must contain the raw YAML or JSON text of the stack descriptor.
+// The server validates the descriptor and returns an error when it is malformed.
+func (c *Client) CreateStackTemplate(ctx context.Context, req CreateStackTemplateRequest) (*CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var t CustomerStackTemplate
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode CreateStackTemplate response: %w", err)
+	}
+	return &t, nil
+}
+
+// ListMyStackTemplates returns all customer-authored stack templates owned by the authenticated user
+// (or the active organization when OrgID is set). First-party catalog entries are not included.
+func (c *Client) ListMyStackTemplates(ctx context.Context) ([]CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/mine", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result listCustomerTemplatesResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListMyStackTemplates response: %w", err)
+	}
+	return result.Templates, nil
+}
+
+// ListMarketplaceStackTemplates returns all published marketplace templates (visibility=public,
+// published=true). Both first-party and customer-authored templates that have been published
+// appear in this listing.
+func (c *Client) ListMarketplaceStackTemplates(ctx context.Context) ([]CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/marketplace", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result listCustomerTemplatesResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListMarketplaceStackTemplates response: %w", err)
+	}
+	return result.Templates, nil
+}
+
+// GetCustomerStackTemplate returns the customer-authored template with the given ID.
+// Returns nil, nil when not found (404).
+func (c *Client) GetCustomerStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/"+id, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, nil
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var t CustomerStackTemplate
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetCustomerStackTemplate response: %w", err)
+	}
+	return &t, nil
+}
+
+// DeleteCustomerStackTemplate deletes the customer-authored template with the given ID.
+// A 404 response is treated as success (idempotent).
+func (c *Client) DeleteCustomerStackTemplate(ctx context.Context, id string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/stacks/templates/"+id, nil, "")
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// PublishStackTemplate marks a customer-authored template as published so it appears in the
+// marketplace. The template must have Visibility=public; the server returns 409 otherwise.
+func (c *Client) PublishStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates/"+id+"/publish", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var t CustomerStackTemplate
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode PublishStackTemplate response: %w", err)
+	}
+	return &t, nil
+}
+
+// UnpublishStackTemplate removes a customer-authored template from the marketplace without
+// deleting it. Existing stacks launched from the template are not affected.
+func (c *Client) UnpublishStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates/"+id+"/unpublish", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var t CustomerStackTemplate
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode UnpublishStackTemplate response: %w", err)
+	}
+	return &t, nil
+}
+
+// PreviewStackUpgrade returns the list of changes and cost delta that would result from
+// upgrading the given stack to the latest version of its template.
+func (c *Client) PreviewStackUpgrade(ctx context.Context, stackID string) (*StackUpgradePreview, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/"+stackID+"/upgrade/preview", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var preview StackUpgradePreview
+	if err := json.Unmarshal(data, &preview); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode PreviewStackUpgrade response: %w", err)
+	}
+	return &preview, nil
+}
+
+// ApplyStackUpgrade applies the pending upgrade for the given stack. The AcceptedMonthlyCost
+// must match the value from a prior PreviewStackUpgrade call within $0.01.
+func (c *Client) ApplyStackUpgrade(ctx context.Context, stackID string, req ApplyStackUpgradeRequest) (*Stack, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/"+stackID+"/upgrade", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var stack Stack
+	if err := json.Unmarshal(data, &stack); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ApplyStackUpgrade response: %w", err)
+	}
+	return &stack, nil
+}
