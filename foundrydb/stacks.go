@@ -80,6 +80,12 @@ type Stack struct {
 	EndpointURL          string          `json:"endpoint_url,omitempty"`
 	EstimatedMonthlyCost float64         `json:"estimated_monthly_cost"`
 	OrganizationID       string          `json:"organization_id,omitempty"`
+	// SourceTemplateID is the UUID of the customer marketplace template this
+	// stack was launched from. Empty for first-party catalog launches.
+	SourceTemplateID string `json:"source_template_id,omitempty"`
+	// SourcePublisherOrgID is the organization that published the marketplace
+	// template. Empty for first-party catalog launches.
+	SourcePublisherOrgID string          `json:"source_publisher_org_id,omitempty"`
 	Resources            []StackResource `json:"resources,omitempty"`
 	CreatedAt            time.Time       `json:"created_at"`
 	UpdatedAt            time.Time       `json:"updated_at"`
@@ -95,17 +101,28 @@ type StackTemplateSummary struct {
 }
 
 // StackPreviewRequest is the body for PreviewStackCost.
+// Exactly one of TemplateName (first-party catalog) or TemplateID (customer
+// marketplace template) must be set.
 type StackPreviewRequest struct {
 	// TemplateName selects the catalog descriptor (e.g. "rag-chatbot").
-	TemplateName string `json:"template_name"`
+	TemplateName string `json:"template_name,omitempty"`
+	// TemplateID selects a customer-authored marketplace template. Use this
+	// instead of TemplateName when previewing a marketplace template.
+	TemplateID string `json:"template_id,omitempty"`
 }
 
 // StackLaunchRequest is the body for LaunchStack.
+// Exactly one of TemplateName (first-party catalog) or TemplateID (customer
+// marketplace template) must be set.
 type StackLaunchRequest struct {
 	// Name is the customer-given instance name.
 	Name string `json:"name"`
-	// TemplateName selects the catalog descriptor (e.g. "rag-chatbot").
-	TemplateName string `json:"template_name"`
+	// TemplateName selects the first-party catalog descriptor (e.g. "rag-chatbot").
+	TemplateName string `json:"template_name,omitempty"`
+	// TemplateID selects a customer-authored marketplace template. The template
+	// must be visible to the caller (publicly published, or org_shared/private
+	// within the caller's organization). Mutually exclusive with TemplateName.
+	TemplateID string `json:"template_id,omitempty"`
 	// OrganizationID optionally scopes the stack (and its inference key) to an
 	// organization the requesting user belongs to. When empty, the caller's
 	// primary billing organization is used.
@@ -293,118 +310,200 @@ func (c *Client) WaitForStackRunning(ctx context.Context, id string, timeout tim
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2: marketplace template management
-// ---------------------------------------------------------------------------
-
-// StackTemplateVisibility controls who can discover and launch a customer-authored template.
-type StackTemplateVisibility string
+// StackVisibility controls who can discover and launch a custom template.
+type StackVisibility string
 
 const (
-	// StackTemplateVisibilityPrivate makes the template visible only to the creating user.
-	StackTemplateVisibilityPrivate StackTemplateVisibility = "private"
-	// StackTemplateVisibilityOrgShared makes the template visible to all members of the owning org.
-	StackTemplateVisibilityOrgShared StackTemplateVisibility = "org_shared"
-	// StackTemplateVisibilityPublic publishes the template to the marketplace (pending review).
-	StackTemplateVisibilityPublic StackTemplateVisibility = "public"
+	// StackVisibilityPrivate restricts the template to the owning organization.
+	StackVisibilityPrivate StackVisibility = "private"
+	// StackVisibilityOrgShared shares the template with the owning
+	// organization's members. Published immediately, no platform review.
+	StackVisibilityOrgShared StackVisibility = "org_shared"
+	// StackVisibilityPublic exposes the template to every organization in the
+	// marketplace, subject to platform admin approval.
+	StackVisibilityPublic StackVisibility = "public"
 )
 
-// CustomerStackTemplate is a customer-authored stack template stored in the platform catalog.
-// First-party templates returned by ListStackTemplates use StackTemplateSummary; this type is
-// for the writable, customer-owned variants managed via the Phase 2 marketplace API.
-type CustomerStackTemplate struct {
-	// ID is the server-assigned UUID for this template.
-	ID string `json:"id"`
-	// Name is the slug identifier for the template (URL-safe, unique within the owning org).
-	Name string `json:"name"`
-	// DisplayName is the human-readable title shown in the marketplace.
-	DisplayName string `json:"display_name"`
-	// Description is an optional long-form description shown on the template detail page.
-	Description string `json:"description"`
-	// Version is a caller-supplied semantic version string (e.g. "1.0.0").
-	Version string `json:"version"`
-	// Visibility controls who can discover and launch this template.
-	Visibility StackTemplateVisibility `json:"visibility"`
-	// Published marks whether the template is live in the marketplace. Only
-	// templates with Visibility=public and Published=true appear in the catalog.
-	Published bool `json:"published"`
-	// OrganizationID is the owning organization UUID.
-	OrganizationID string `json:"organization_id,omitempty"`
-	// Descriptor holds the raw YAML or JSON content of the stack descriptor
-	// as submitted via CreateStackTemplate. On read it is returned as-is.
-	Descriptor string `json:"descriptor,omitempty"`
-	// CostPreview is an optional server-computed cost estimate included when
-	// the server can evaluate the descriptor at list/get time.
-	CostPreview *StackCostPreview `json:"cost_preview,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+// StackPublicationStatus is the moderation lifecycle of a custom template.
+type StackPublicationStatus string
+
+const (
+	// PublicationStatusDraft is the initial state: visible only to the owning org.
+	PublicationStatusDraft StackPublicationStatus = "draft"
+	// PublicationStatusSubmitted means the author requested public listing;
+	// awaiting platform admin review.
+	PublicationStatusSubmitted StackPublicationStatus = "submitted"
+	// PublicationStatusApproved is set by a platform admin; typically followed
+	// immediately by published.
+	PublicationStatusApproved StackPublicationStatus = "approved"
+	// PublicationStatusPublished means the template is live and launchable.
+	PublicationStatusPublished StackPublicationStatus = "published"
+	// PublicationStatusRejected means the admin declined the public submission.
+	PublicationStatusRejected StackPublicationStatus = "rejected"
+	// PublicationStatusUnpublished means the template was published and then
+	// withdrawn (by the author or by an admin takedown).
+	PublicationStatusUnpublished StackPublicationStatus = "unpublished"
+)
+
+// StackDescriptorResource is one resource entry in a StackDescriptor.
+type StackDescriptorResource struct {
+	Name string         `json:"name"`
+	Kind string         `json:"kind"`
+	Spec map[string]any `json:"spec"`
 }
 
-// CreateStackTemplateRequest is the body for CreateStackTemplate (POST /stacks/templates).
-type CreateStackTemplateRequest struct {
-	// Name is a URL-safe slug for the template (required).
-	Name string `json:"name"`
-	// DisplayName is the human-readable title (required).
-	DisplayName string `json:"display_name"`
-	// Description is an optional long-form description.
+// StackDescriptor is the declarative definition of a stack.
+type StackDescriptor struct {
+	APIVersion   string                    `json:"apiVersion,omitempty"`
+	Name         string                    `json:"name,omitempty"`
+	DisplayName  string                    `json:"displayName,omitempty"`
+	Description  string                    `json:"description,omitempty"`
+	Version      string                    `json:"version,omitempty"`
+	Resources    []StackDescriptorResource `json:"resources"`
+	Dependencies map[string][]string       `json:"dependencies,omitempty"`
+}
+
+// CustomStackTemplate is a customer-authored stack template.
+// Published templates are immutable versions; editing one requires creating a
+// new version. The first-party embedded catalog is unaffected by these rows.
+type CustomStackTemplate struct {
+	ID                string                 `json:"id"`
+	Name              string                 `json:"name"`
+	DisplayName       string                 `json:"display_name"`
+	Description       string                 `json:"description"`
+	Version           string                 `json:"version"`
+	Descriptor        StackDescriptor        `json:"descriptor"`
+	PublisherUserID   string                 `json:"publisher_user_id"`
+	OrganizationID    string                 `json:"organization_id"`
+	Visibility        StackVisibility        `json:"visibility"`
+	PublicationStatus StackPublicationStatus `json:"publication_status"`
+	// ApproverUserID is the admin who approved this template; empty until approval.
+	ApproverUserID string `json:"approver_user_id,omitempty"`
+	// ApprovedAt is the timestamp of approval; zero until approval.
+	ApprovedAt *time.Time `json:"approved_at,omitempty"`
+	// ModerationReason carries the note from the last moderation action.
+	ModerationReason string    `json:"moderation_reason,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// CustomTemplateRequest is the authoring payload for creating or updating a
+// customer stack template. On PATCH all fields are optional; only non-zero
+// fields are applied.
+type CustomTemplateRequest struct {
+	// Name is the unique template identifier (slug-style). Required on POST.
+	Name string `json:"name,omitempty"`
+	// DisplayName is the human-readable name shown in the marketplace catalog.
+	DisplayName string `json:"display_name,omitempty"`
+	// Description is a short description of what this template provisions.
 	Description string `json:"description,omitempty"`
-	// Version is a caller-supplied semver string (required, e.g. "1.0.0").
-	Version string `json:"version"`
-	// Visibility controls who can discover the template (default: private).
-	Visibility StackTemplateVisibility `json:"visibility,omitempty"`
-	// Descriptor is the raw YAML or JSON content of the stack descriptor (required).
-	Descriptor string `json:"descriptor"`
+	// Version is the semantic version of this descriptor (defaults to "1.0.0").
+	Version string `json:"version,omitempty"`
+	// Visibility controls who can see and launch this template.
+	Visibility StackVisibility `json:"visibility,omitempty"`
+	// Descriptor is the authored stack definition validated by the platform.
+	Descriptor StackDescriptor `json:"descriptor"`
 }
 
-// StackUpgradeChangeItem describes one change that will be applied during an upgrade.
-type StackUpgradeChangeItem struct {
-	// Resource is the symbolic name of the resource being changed.
-	Resource string `json:"resource"`
-	// Field is the name of the field being changed (e.g. "plan_name", "version").
-	Field string `json:"field"`
-	// OldValue is the current value of the field (as a string representation).
-	OldValue string `json:"old_value"`
-	// NewValue is the value that will be set after the upgrade.
-	NewValue string `json:"new_value"`
+// ResourceChangeType classifies one resource's delta in an upgrade plan.
+type ResourceChangeType string
+
+const (
+	// ResourceChangeUnchanged means the resource spec is identical; no action.
+	ResourceChangeUnchanged ResourceChangeType = "unchanged"
+	// ResourceChangeInPlace means a safe, non-destructive edit will be applied
+	// (app image redeploy, plan resize, inference remint).
+	ResourceChangeInPlace ResourceChangeType = "in_place"
+	// ResourceChangeBlocked means the change requires recreating a stateful
+	// resource, changing a database engine or version, adding/removing a
+	// resource, or changing a container port. A fresh stack is required.
+	ResourceChangeBlocked ResourceChangeType = "blocked"
+)
+
+// ResourceChange is one resource's classified delta in an upgrade plan.
+type ResourceChange struct {
+	// SymbolicName is the resource's name from the descriptor.
+	SymbolicName string `json:"symbolic_name"`
+	// Kind is the platform primitive this resource represents.
+	Kind string `json:"kind"`
+	// Change classifies the delta for this resource.
+	Change ResourceChangeType `json:"change"`
+	// Action is the executor verb for an in_place change: "redeploy_app",
+	// "scale_app", "scale_service", "remint_inference", or "" for unchanged.
+	Action string `json:"action,omitempty"`
+	// Reason explains a blocked change.
+	Reason string `json:"reason,omitempty"`
+	// TargetSpec is the resolved spec to apply for an in_place change.
+	TargetSpec map[string]any `json:"target_spec,omitempty"`
+	// Done marks an applied step so the reconciler is re-entrant.
+	Done bool `json:"done,omitempty"`
 }
 
-// StackUpgradePreview is the result of PreviewStackUpgrade.
-type StackUpgradePreview struct {
-	// StackID is the stack this preview applies to.
-	StackID string `json:"stack_id"`
-	// TemplateName is the template that will be used for the upgrade.
-	TemplateName string `json:"template_name"`
-	// CurrentTemplateVersion is the version currently running on the stack.
-	CurrentTemplateVersion string `json:"current_template_version"`
-	// NewTemplateVersion is the version the stack will be upgraded to.
-	NewTemplateVersion string `json:"new_template_version"`
-	// Changes is the list of per-resource field changes this upgrade will apply.
-	Changes []StackUpgradeChangeItem `json:"changes"`
-	// CurrentMonthlyCost is the current estimated monthly cost for the stack.
-	CurrentMonthlyCost float64 `json:"current_monthly_cost"`
+// StackUpgradePlan is the computed diff between a running stack and the target
+// template version, plus the new and delta cost.
+type StackUpgradePlan struct {
+	// FromVersion is the template version currently snapshotted on the stack.
+	FromVersion string `json:"from_version"`
+	// ToVersion is the template version the stack would be upgraded to.
+	ToVersion string `json:"to_version"`
+	// Changes is the per-resource classified delta.
+	Changes []ResourceChange `json:"changes"`
 	// NewMonthlyCost is the estimated monthly cost after the upgrade.
 	NewMonthlyCost float64 `json:"new_monthly_cost"`
-	// CostDelta is NewMonthlyCost minus CurrentMonthlyCost (negative = cheaper).
+	// CurrentMonthlyCost is the monthly cost accepted at launch time.
+	CurrentMonthlyCost float64 `json:"current_monthly_cost"`
+	// CostDelta is the difference (NewMonthlyCost minus CurrentMonthlyCost).
 	CostDelta float64 `json:"cost_delta"`
-	// Currency is the ISO 4217 code for all cost amounts.
-	Currency string `json:"currency"`
+	// Blocked is true when any resource has a blocked change. The upgrade
+	// cannot proceed in place; a fresh stack is required.
+	Blocked bool `json:"blocked"`
+	// BlockedReasons carries a human-readable description of each blocked change.
+	BlockedReasons []string `json:"blocked_reasons,omitempty"`
 }
 
-// ApplyStackUpgradeRequest is the body for ApplyStackUpgrade.
-type ApplyStackUpgradeRequest struct {
-	// AcceptedMonthlyCost is the new monthly cost previewed by PreviewStackUpgrade.
-	// Required; the upgrade is rejected if the freshly computed cost differs by more than $0.01.
-	AcceptedMonthlyCost float64 `json:"accepted_monthly_cost"`
+// StackUpgradeRequest is the body for ApplyStackUpgrade.
+type StackUpgradeRequest struct {
+	// AcceptedMonthlyCost is the new monthly cost the customer accepted after
+	// calling PreviewStackUpgrade. Required; enforced as a cost gate.
+	AcceptedMonthlyCost *float64 `json:"accepted_monthly_cost,omitempty"`
 }
 
-type listCustomerTemplatesResponse struct {
-	Templates []CustomerStackTemplate `json:"templates"`
+// StackMigrationStatus is the lifecycle of an in-place stack upgrade.
+type StackMigrationStatus string
+
+const (
+	StackMigrationAccepted  StackMigrationStatus = "Accepted"
+	StackMigrationApplying  StackMigrationStatus = "Applying"
+	StackMigrationCompleted StackMigrationStatus = "Completed"
+	StackMigrationFailed    StackMigrationStatus = "Failed"
+)
+
+// StackMigration is one in-flight or completed in-place upgrade of a stack.
+// Created when ApplyStackUpgrade is accepted. The reconciler drives it from
+// Accepted through Applying to Completed, or to Failed if a step fails (without
+// tearing the stack down).
+type StackMigration struct {
+	ID                  string               `json:"id"`
+	StackID             string               `json:"stack_id"`
+	FromTemplateVersion string               `json:"from_template_version"`
+	ToTemplateVersion   string               `json:"to_template_version"`
+	Changes             []ResourceChange     `json:"changes"`
+	Status              StackMigrationStatus `json:"status"`
+	StatusDetail        string               `json:"status_detail,omitempty"`
+	AcceptedMonthlyCost float64              `json:"accepted_monthly_cost"`
+	CreatedAt           time.Time            `json:"created_at"`
+	UpdatedAt           time.Time            `json:"updated_at"`
 }
 
-// CreateStackTemplate creates a new customer-authored stack template in the platform catalog.
-// The descriptor field must contain the raw YAML or JSON text of the stack descriptor.
-// The server validates the descriptor and returns an error when it is malformed.
-func (c *Client) CreateStackTemplate(ctx context.Context, req CreateStackTemplateRequest) (*CustomerStackTemplate, error) {
+type listCustomTemplatesResponse struct {
+	Templates []CustomStackTemplate `json:"templates"`
+}
+
+// CreateStackTemplate creates a new customer-authored template. The template
+// starts in draft status and is only visible to the owning organization.
+// Set Visibility to org_shared or public and call PublishStackTemplate to
+// share it.
+func (c *Client) CreateStackTemplate(ctx context.Context, req CustomTemplateRequest) (*CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates", req, "")
 	if err != nil {
 		return nil, err
@@ -413,16 +512,16 @@ func (c *Client) CreateStackTemplate(ctx context.Context, req CreateStackTemplat
 	if err != nil {
 		return nil, err
 	}
-	var t CustomerStackTemplate
-	if err := json.Unmarshal(data, &t); err != nil {
+	var tmpl CustomStackTemplate
+	if err := json.Unmarshal(data, &tmpl); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode CreateStackTemplate response: %w", err)
 	}
-	return &t, nil
+	return &tmpl, nil
 }
 
-// ListMyStackTemplates returns all customer-authored stack templates owned by the authenticated user
-// (or the active organization when OrgID is set). First-party catalog entries are not included.
-func (c *Client) ListMyStackTemplates(ctx context.Context) ([]CustomerStackTemplate, error) {
+// ListMyStackTemplates returns all templates owned by the caller's organization,
+// regardless of visibility or publication status.
+func (c *Client) ListMyStackTemplates(ctx context.Context) ([]CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/mine", nil, "")
 	if err != nil {
 		return nil, err
@@ -431,17 +530,16 @@ func (c *Client) ListMyStackTemplates(ctx context.Context) ([]CustomerStackTempl
 	if err != nil {
 		return nil, err
 	}
-	var result listCustomerTemplatesResponse
+	var result listCustomTemplatesResponse
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode ListMyStackTemplates response: %w", err)
 	}
 	return result.Templates, nil
 }
 
-// ListMarketplaceStackTemplates returns all published marketplace templates (visibility=public,
-// published=true). Both first-party and customer-authored templates that have been published
-// appear in this listing.
-func (c *Client) ListMarketplaceStackTemplates(ctx context.Context) ([]CustomerStackTemplate, error) {
+// ListMarketplaceStackTemplates returns all customer-authored templates that
+// are publicly published in the marketplace. Any organization may launch them.
+func (c *Client) ListMarketplaceStackTemplates(ctx context.Context) ([]CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/marketplace", nil, "")
 	if err != nil {
 		return nil, err
@@ -450,16 +548,16 @@ func (c *Client) ListMarketplaceStackTemplates(ctx context.Context) ([]CustomerS
 	if err != nil {
 		return nil, err
 	}
-	var result listCustomerTemplatesResponse
+	var result listCustomTemplatesResponse
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode ListMarketplaceStackTemplates response: %w", err)
 	}
 	return result.Templates, nil
 }
 
-// GetCustomerStackTemplate returns the customer-authored template with the given ID.
-// Returns nil, nil when not found (404).
-func (c *Client) GetCustomerStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+// GetStackTemplate returns the custom template with the given UUID.
+// Returns nil, nil when it does not exist or is not visible to the caller (404).
+func (c *Client) GetStackTemplate(ctx context.Context, id string) (*CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates/"+id, nil, "")
 	if err != nil {
 		return nil, err
@@ -472,21 +570,41 @@ func (c *Client) GetCustomerStackTemplate(ctx context.Context, id string) (*Cust
 	if err != nil {
 		return nil, err
 	}
-	var t CustomerStackTemplate
-	if err := json.Unmarshal(data, &t); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode GetCustomerStackTemplate response: %w", err)
+	var tmpl CustomStackTemplate
+	if err := json.Unmarshal(data, &tmpl); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetStackTemplate response: %w", err)
 	}
-	return &t, nil
+	return &tmpl, nil
 }
 
-// DeleteCustomerStackTemplate deletes the customer-authored template with the given ID.
+// UpdateStackTemplate partially updates a custom template. Only templates in
+// draft, rejected, or unpublished status can be edited. Returns an APIError
+// with status 409 when the template is in an immutable state.
+func (c *Client) UpdateStackTemplate(ctx context.Context, id string, req CustomTemplateRequest) (*CustomStackTemplate, error) {
+	resp, err := c.do(ctx, http.MethodPatch, "/stacks/templates/"+id, req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var tmpl CustomStackTemplate
+	if err := json.Unmarshal(data, &tmpl); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode UpdateStackTemplate response: %w", err)
+	}
+	return &tmpl, nil
+}
+
+// DeleteStackTemplate soft-deletes a custom template. Stacks already launched
+// from it continue to run on their own descriptor snapshot.
 // A 404 response is treated as success (idempotent).
-func (c *Client) DeleteCustomerStackTemplate(ctx context.Context, id string) error {
+func (c *Client) DeleteStackTemplate(ctx context.Context, id string) error {
 	resp, err := c.do(ctx, http.MethodDelete, "/stacks/templates/"+id, nil, "")
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode == http.StatusNotFound {
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNoContent {
 		resp.Body.Close()
 		return nil
 	}
@@ -494,9 +612,11 @@ func (c *Client) DeleteCustomerStackTemplate(ctx context.Context, id string) err
 	return err
 }
 
-// PublishStackTemplate marks a customer-authored template as published so it appears in the
-// marketplace. The template must have Visibility=public; the server returns 409 otherwise.
-func (c *Client) PublishStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+// PublishStackTemplate initiates publication of a custom template.
+// For org_shared visibility: publishes immediately.
+// For public visibility: submits to the platform admin moderation queue.
+// The template must have visibility set to org_shared or public first.
+func (c *Client) PublishStackTemplate(ctx context.Context, id string) (*CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates/"+id+"/publish", nil, "")
 	if err != nil {
 		return nil, err
@@ -505,16 +625,16 @@ func (c *Client) PublishStackTemplate(ctx context.Context, id string) (*Customer
 	if err != nil {
 		return nil, err
 	}
-	var t CustomerStackTemplate
-	if err := json.Unmarshal(data, &t); err != nil {
+	var tmpl CustomStackTemplate
+	if err := json.Unmarshal(data, &tmpl); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode PublishStackTemplate response: %w", err)
 	}
-	return &t, nil
+	return &tmpl, nil
 }
 
-// UnpublishStackTemplate removes a customer-authored template from the marketplace without
-// deleting it. Existing stacks launched from the template are not affected.
-func (c *Client) UnpublishStackTemplate(ctx context.Context, id string) (*CustomerStackTemplate, error) {
+// UnpublishStackTemplate withdraws a template from publication. Stops new
+// launches from this template; running stacks are unaffected.
+func (c *Client) UnpublishStackTemplate(ctx context.Context, id string) (*CustomStackTemplate, error) {
 	resp, err := c.do(ctx, http.MethodPost, "/stacks/templates/"+id+"/unpublish", nil, "")
 	if err != nil {
 		return nil, err
@@ -523,17 +643,24 @@ func (c *Client) UnpublishStackTemplate(ctx context.Context, id string) (*Custom
 	if err != nil {
 		return nil, err
 	}
-	var t CustomerStackTemplate
-	if err := json.Unmarshal(data, &t); err != nil {
+	var tmpl CustomStackTemplate
+	if err := json.Unmarshal(data, &tmpl); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode UnpublishStackTemplate response: %w", err)
 	}
-	return &t, nil
+	return &tmpl, nil
 }
 
-// PreviewStackUpgrade returns the list of changes and cost delta that would result from
-// upgrading the given stack to the latest version of its template.
-func (c *Client) PreviewStackUpgrade(ctx context.Context, stackID string) (*StackUpgradePreview, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/stacks/"+stackID+"/upgrade/preview", nil, "")
+// --- In-place stack upgrades ---
+
+// PreviewStackUpgrade computes the classified diff between the running stack's
+// snapshotted descriptor and the current version of its template, plus the new
+// and delta cost. Call this before ApplyStackUpgrade.
+//
+// When the plan is blocked (plan.Blocked == true), the upgrade cannot proceed
+// in place and the customer must launch a fresh stack. A blocked plan still
+// returns success (no error); inspect the Changes field for reasons.
+func (c *Client) PreviewStackUpgrade(ctx context.Context, stackID string) (*StackUpgradePlan, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/"+stackID+"/upgrade/preview", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -541,27 +668,39 @@ func (c *Client) PreviewStackUpgrade(ctx context.Context, stackID string) (*Stac
 	if err != nil {
 		return nil, err
 	}
-	var preview StackUpgradePreview
-	if err := json.Unmarshal(data, &preview); err != nil {
+	var plan StackUpgradePlan
+	if err := json.Unmarshal(data, &plan); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode PreviewStackUpgrade response: %w", err)
 	}
-	return &preview, nil
+	return &plan, nil
 }
 
-// ApplyStackUpgrade applies the pending upgrade for the given stack. The AcceptedMonthlyCost
-// must match the value from a prior PreviewStackUpgrade call within $0.01.
-func (c *Client) ApplyStackUpgrade(ctx context.Context, stackID string, req ApplyStackUpgradeRequest) (*Stack, error) {
+// ApplyStackUpgrade applies a previewed in-place upgrade of the stack.
+// The AcceptedMonthlyCost field in req must match the new cost from
+// PreviewStackUpgrade within $0.01; a drift returns APIError status 409.
+//
+// Returns a StackMigration when the upgrade is accepted (202 Accepted).
+// Returns nil, nil when the stack is already on the latest version (200 OK
+// with status "up_to_date"). Returns an APIError with status 422 when the
+// plan is blocked. Returns an APIError with status 409 when an upgrade is
+// already in progress.
+func (c *Client) ApplyStackUpgrade(ctx context.Context, stackID string, req StackUpgradeRequest) (*StackMigration, error) {
 	resp, err := c.do(ctx, http.MethodPost, "/stacks/"+stackID+"/upgrade", req, "")
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusOK {
+		// up_to_date: the stack is already on the latest version.
+		resp.Body.Close()
+		return nil, nil
+	}
 	data, err := checkResponse(resp)
 	if err != nil {
 		return nil, err
 	}
-	var stack Stack
-	if err := json.Unmarshal(data, &stack); err != nil {
+	var mig StackMigration
+	if err := json.Unmarshal(data, &mig); err != nil {
 		return nil, fmt.Errorf("foundrydb: decode ApplyStackUpgrade response: %w", err)
 	}
-	return &stack, nil
+	return &mig, nil
 }
