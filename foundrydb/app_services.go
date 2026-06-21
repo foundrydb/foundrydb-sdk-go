@@ -796,3 +796,136 @@ func (c *Client) WaitForAppRunning(ctx context.Context, id string, timeout time.
 		}
 	}
 }
+
+// AttachmentCatalogEntry is one installable companion app in the catalog: a
+// curated app (for example Metabase) that can be attached to a database service
+// by its Kind. ParentEngines lists the database engines it supports.
+type AttachmentCatalogEntry struct {
+	Kind          string   `json:"kind"`
+	DisplayName   string   `json:"display_name"`
+	Description   string   `json:"description"`
+	Category      string   `json:"category"`
+	DefaultPlan   string   `json:"default_plan"`
+	ParentEngines []string `json:"parent_engines"`
+}
+
+type attachmentCatalogResponse struct {
+	Attachments []AttachmentCatalogEntry `json:"attachments"`
+}
+
+// GetAttachmentCatalog lists the installable companion apps. The catalog is
+// static and read-only; each Kind is a value accepted by CreateAttachment.
+func (c *Client) GetAttachmentCatalog(ctx context.Context) ([]AttachmentCatalogEntry, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/attachment-catalog", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result attachmentCatalogResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetAttachmentCatalog response: %w", err)
+	}
+	return result.Attachments, nil
+}
+
+// CreateAttachmentRequest is the body of CreateAttachment. Only Kind is
+// required; PlanName and Subdomain override the catalog descriptor's defaults.
+type CreateAttachmentRequest struct {
+	Kind      string `json:"kind"`
+	PlanName  string `json:"plan_name,omitempty"`
+	Subdomain string `json:"subdomain,omitempty"`
+}
+
+// CreateAttachment provisions a companion app from the catalog against a parent
+// database service and links it over a private SDN. serviceID is the parent
+// database service id. Returns the created app service, whose lifecycle is then
+// managed through the app-service methods keyed by its id.
+func (c *Client) CreateAttachment(ctx context.Context, serviceID string, req CreateAttachmentRequest) (*AppService, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/managed-services/"+serviceID+"/attachments", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var app AppService
+	if err := json.Unmarshal(data, &app); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode CreateAttachment response: %w", err)
+	}
+	return &app, nil
+}
+
+// AttachmentSummary is one companion app attached to a database service: the
+// app service id and kind, its status, and the attachment wiring status.
+type AttachmentSummary struct {
+	AttachmentID string `json:"attachment_id"`
+	AppServiceID string `json:"app_service_id"`
+	Kind         string `json:"kind"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	WiringStatus string `json:"wiring_status"`
+	URL          string `json:"url,omitempty"`
+}
+
+type listAttachmentsResponse struct {
+	Attachments []AttachmentSummary `json:"attachments"`
+}
+
+// ListAttachments lists the companion apps attached to a database service.
+// serviceID is the parent database service id.
+func (c *Client) ListAttachments(ctx context.Context, serviceID string) ([]AttachmentSummary, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/managed-services/"+serviceID+"/attachments", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result listAttachmentsResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListAttachments response: %w", err)
+	}
+	return result.Attachments, nil
+}
+
+// AttachmentCredentials is the generated admin login for a catalog attachment's
+// companion app, plus the login URL. An app whose admin is created by a
+// post-deploy hook (for example Metabase) reports it in AdminEmail and
+// AdminPassword; an app that bootstraps its admin from environment (for example
+// Directus) reports the reveal-flagged generated values in Generated (for
+// example ADMIN_EMAIL and ADMIN_PASSWORD). Every secret is decrypted on demand
+// and returned only here.
+type AttachmentCredentials struct {
+	AdminEmail    string `json:"admin_email,omitempty"`
+	AdminPassword string `json:"admin_password,omitempty"`
+	// Generated maps each reveal-flagged generated environment key to its
+	// decrypted value, for an attachment whose admin is bootstrapped from
+	// environment rather than a post-deploy hook.
+	Generated map[string]string `json:"generated,omitempty"`
+	LoginURL  string            `json:"login_url,omitempty"`
+}
+
+// GetAttachmentCredentials reveals the generated admin credential for a catalog
+// attachment's companion app. appServiceID is the companion app service id.
+// Only catalog attachments carry generated credentials; otherwise the API
+// returns 404.
+func (c *Client) GetAttachmentCredentials(ctx context.Context, appServiceID string) (*AttachmentCredentials, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/attachment-credentials", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var creds AttachmentCredentials
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetAttachmentCredentials response: %w", err)
+	}
+	return &creds, nil
+}
