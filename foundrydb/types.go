@@ -205,3 +205,106 @@ type ListBackupsResponse struct {
 type CreateBackupRequest struct {
 	BackupType BackupType `json:"backup_type,omitempty"`
 }
+
+// ControlAssertion describes a single control assertion within a compliance evidence packet.
+type ControlAssertion struct {
+	ControlID    string   `json:"control_id"`
+	Title        string   `json:"title"`
+	Assertion    string   `json:"assertion"`
+	Status       string   `json:"status"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
+// CompliancePacketOrg contains the organization fields embedded in a compliance packet.
+type CompliancePacketOrg struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	BillingEmail string `json:"billing_email,omitempty"`
+	Country      string `json:"country,omitempty"`
+}
+
+// CompliancePacketAuditLog describes the audit log coverage included in a compliance packet.
+type CompliancePacketAuditLog struct {
+	RetentionPolicy string  `json:"retention_policy"`
+	OldestEntryAt   *string `json:"oldest_entry_at,omitempty"`
+	EntryCount      int64   `json:"entry_count"`
+}
+
+// CompliancePacketSummary contains aggregate statistics embedded in a compliance packet.
+type CompliancePacketSummary struct {
+	ServiceCount  int                      `json:"service_count"`
+	AllServicesEU bool                     `json:"all_services_eu_residency"`
+	AuditLog      CompliancePacketAuditLog `json:"audit_log"`
+}
+
+// CompliancePacket is the canonical signed compliance evidence document. It contains
+// the scope boundary, per-control assertions, and a summary of the organization's
+// data residency posture for the reporting period.
+type CompliancePacket struct {
+	SchemaVersion string                  `json:"schema_version"`
+	Framework     string                  `json:"framework"`
+	GeneratedAt   string                  `json:"generated_at"`
+	PeriodStart   string                  `json:"period_start"`
+	PeriodEnd     string                  `json:"period_end"`
+	Organization  CompliancePacketOrg     `json:"organization"`
+	ScopeBoundary string                  `json:"scope_boundary"`
+	Controls      []ControlAssertion      `json:"controls"`
+	Summary       CompliancePacketSummary `json:"summary"`
+}
+
+// CompliancePacketSignature holds the Ed25519 signature that authenticates a
+// CompliancePacket. KeyID references a key published at
+// /.well-known/compliance-signing-keys.
+type CompliancePacketSignature struct {
+	Algorithm       string `json:"algorithm"`
+	KeyID           string `json:"key_id"`
+	Value           string `json:"value"`
+	CanonicalSHA256 string `json:"canonical_sha256"`
+}
+
+// CompliancePacketResponse bundles a CompliancePacket with its detached signature.
+type CompliancePacketResponse struct {
+	Packet    CompliancePacket          `json:"packet"`
+	Signature CompliancePacketSignature `json:"signature"`
+}
+
+// GenerateComplianceReportResponse is the response body for
+// POST /organizations/{orgID}/compliance-reports (HTTP 201).
+type GenerateComplianceReportResponse struct {
+	ReportID string `json:"report_id"`
+	CompliancePacketResponse
+}
+
+// ComplianceReportRecord is a summary entry returned by
+// GET /organizations/{orgID}/compliance-reports.
+type ComplianceReportRecord struct {
+	ID             string `json:"id"`
+	OrganizationID string `json:"organization_id"`
+	Framework      string `json:"framework"`
+	SchemaVersion  string `json:"schema_version"`
+	PeriodStart    string `json:"period_start"`
+	PeriodEnd      string `json:"period_end"`
+	GeneratedAt    string `json:"generated_at"`
+	GeneratedBy    string `json:"generated_by"`
+	SigningKeyID   string `json:"signing_key_id"`
+	Algorithm      string `json:"algorithm"`
+	Status         string `json:"status"`
+	HasPDF         bool   `json:"has_pdf"`
+}
+
+// ComplianceSigningKey is a single public key entry returned by
+// GET /.well-known/compliance-signing-keys.
+type ComplianceSigningKey struct {
+	KeyID     string  `json:"key_id"`
+	Algorithm string  `json:"algorithm"`
+	PublicKey string  `json:"public_key"`
+	Active    bool    `json:"active"`
+	RetiredAt *string `json:"retired_at,omitempty"`
+}
+
+// ComplianceSigningKeySet is the full key set returned by
+// GET /.well-known/compliance-signing-keys.
+type ComplianceSigningKeySet struct {
+	Algorithm string                 `json:"algorithm"`
+	Keys      []ComplianceSigningKey `json:"keys"`
+}

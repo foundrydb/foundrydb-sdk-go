@@ -166,6 +166,47 @@ Returns all backup records for the given service, newest first.
 
 Requests an on-demand backup. Set `BackupType` to `foundrydb.BackupTypeFull`, `foundrydb.BackupTypeIncremental`, or `foundrydb.BackupTypePITR`. Leave empty for the platform default.
 
+### Compliance
+
+Generate and retrieve signed compliance evidence packets for SOC 2 Type II and GDPR Article 30 (ROPA) reporting.
+
+#### `GenerateComplianceReport(ctx, orgID, framework string) (*GenerateComplianceReportResponse, error)`
+
+Requests a new signed evidence packet for the given organization. `framework` must be `"soc2"` or `"gdpr_ropa"`. The response embeds the full `CompliancePacket`, its Ed25519 detached signature, and a stable `ReportID` for later retrieval.
+
+#### `ListComplianceReports(ctx, orgID string) ([]ComplianceReportRecord, error)`
+
+Returns all previously generated compliance report records for the organization, newest first.
+
+#### `DownloadComplianceReportJSON(ctx, orgID, reportID string) ([]byte, error)`
+
+Returns the raw signed packet JSON for the given report. The Ed25519 signature inside the envelope can be verified against the keys published at `/.well-known/compliance-signing-keys`.
+
+#### `DownloadComplianceReportPDF(ctx, orgID, reportID string) ([]byte, error)`
+
+Returns the rendered PDF bytes for the given report. The PDF includes QR-encoded verification metadata for use in external audit workflows.
+
+#### `ComplianceSigningKeys(ctx) (*ComplianceSigningKeySet, error)`
+
+Returns the set of public keys used to sign compliance packets. This endpoint is unauthenticated and is suitable for use by external auditors.
+
+```go
+// Generate a SOC 2 evidence packet
+report, err := client.GenerateComplianceReport(ctx, orgID, "soc2")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Report ID: %s\n", report.ReportID)
+fmt.Printf("Framework: %s\n", report.Packet.Framework)
+fmt.Printf("Period: %s to %s\n", report.Packet.PeriodStart, report.Packet.PeriodEnd)
+
+// Download the signed JSON for auditor verification
+jsonBytes, err := client.DownloadComplianceReportJSON(ctx, orgID, report.ReportID)
+
+// Download the human-readable PDF
+pdfBytes, err := client.DownloadComplianceReportPDF(ctx, orgID, report.ReportID)
+```
+
 ## Error Handling
 
 All methods return a typed `*foundrydb.APIError` on non-2xx API responses. Use the helper functions to check specific conditions:
