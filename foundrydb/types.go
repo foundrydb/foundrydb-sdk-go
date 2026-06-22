@@ -308,3 +308,13 @@ type ComplianceSigningKeySet struct {
 	Algorithm string                 `json:"algorithm"`
 	Keys      []ComplianceSigningKey `json:"keys"`
 }
+
+// ComplianceSubscription is an organization's subscription status for one
+// compliance framework.
+type ComplianceSubscription struct {
+	Framework       string  `json:"framework"`
+	Enabled         bool    `json:"enabled"`
+	MonthlyPriceEUR float64 `json:"monthly_price_eur"`
+	SubscribedAt    *string `json:"subscribed_at,omitempty"`
+	CanceledAt      *string `json:"canceled_at,omitempty"`
+}

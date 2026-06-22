@@ -190,6 +190,22 @@ Returns the rendered PDF bytes for the given report. The PDF includes QR-encoded
 
 Returns the set of public keys used to sign compliance packets. This endpoint is unauthenticated and is suitable for use by external auditors.
 
+#### `ListComplianceSubscriptions(ctx, orgID string) ([]ComplianceSubscription, error)`
+
+Returns every supported framework with the organization's subscription status and monthly price.
+
+#### `SubscribeComplianceFramework(ctx, orgID, framework string) ([]ComplianceSubscription, error)`
+
+Enables a paid monthly subscription for the given framework (required to generate that framework's packets). Returns the updated subscription list.
+
+#### `UnsubscribeComplianceFramework(ctx, orgID, framework string) ([]ComplianceSubscription, error)`
+
+Disables a framework subscription. Returns the updated subscription list.
+
+#### `RotateComplianceSigningKey(ctx) (*ComplianceSigningKeySet, error)`
+
+Mints a new active signing key and retires the current one (admin only). Returns the published key set after rotation.
+
 ```go
 // Generate a SOC 2 evidence packet
 report, err := client.GenerateComplianceReport(ctx, orgID, "soc2")

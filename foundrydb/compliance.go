@@ -107,3 +107,74 @@ func (c *Client) ComplianceSigningKeys(ctx context.Context) (*ComplianceSigningK
 	}
 	return &result, nil
 }
+
+// complianceSubscriptionsResponse is the envelope for the subscription endpoints.
+type complianceSubscriptionsResponse struct {
+	Subscriptions []ComplianceSubscription `json:"subscriptions"`
+}
+
+// ListComplianceSubscriptions returns every supported framework with the
+// organization's subscription status and monthly price.
+func (c *Client) ListComplianceSubscriptions(ctx context.Context, orgID string) ([]ComplianceSubscription, error) {
+	path := "/organizations/" + orgID + "/compliance-subscriptions"
+	resp, err := c.do(ctx, http.MethodGet, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result complianceSubscriptionsResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListComplianceSubscriptions response: %w", err)
+	}
+	return result.Subscriptions, nil
+}
+
+// SubscribeComplianceFramework enables a paid monthly subscription for the
+// framework (required to generate that framework's packets). Returns the updated
+// subscription list.
+func (c *Client) SubscribeComplianceFramework(ctx context.Context, orgID, framework string) ([]ComplianceSubscription, error) {
+	return c.setComplianceSubscription(ctx, orgID, framework, http.MethodPut)
+}
+
+// UnsubscribeComplianceFramework disables a framework subscription.
+func (c *Client) UnsubscribeComplianceFramework(ctx context.Context, orgID, framework string) ([]ComplianceSubscription, error) {
+	return c.setComplianceSubscription(ctx, orgID, framework, http.MethodDelete)
+}
+
+func (c *Client) setComplianceSubscription(ctx context.Context, orgID, framework, method string) ([]ComplianceSubscription, error) {
+	path := "/organizations/" + orgID + "/compliance-subscriptions/" + framework
+	resp, err := c.do(ctx, method, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result complianceSubscriptionsResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode compliance subscription response: %w", err)
+	}
+	return result.Subscriptions, nil
+}
+
+// RotateComplianceSigningKey mints a new active signing key and retires the
+// current one (admin only). Returns the published key set after rotation.
+func (c *Client) RotateComplianceSigningKey(ctx context.Context) (*ComplianceSigningKeySet, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/admin/compliance/signing-keys/rotate", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result ComplianceSigningKeySet
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode RotateComplianceSigningKey response: %w", err)
+	}
+	return &result, nil
+}
