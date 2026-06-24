@@ -101,6 +101,42 @@ const (
 type EdgeCacheRule struct {
 	PathPrefix string `json:"path_prefix"`
 	TTLSeconds int    `json:"ttl_seconds"`
+	// StaleWhileRevalidateSeconds, when positive, lets the edge serve a stale
+	// cached response for up to this many seconds past expiry while it
+	// revalidates the entry in the background, so a client never blocks on a
+	// refresh. 0 (the default) disables stale-while-revalidate for the rule.
+	StaleWhileRevalidateSeconds int `json:"stale_while_revalidate_seconds,omitempty"`
+	// StaleIfErrorSeconds, when positive, lets the edge serve a stale cached
+	// response for up to this many seconds past expiry when the origin returns an
+	// error (or is unreachable), so a transient origin failure does not surface to
+	// the client. 0 (the default) disables stale-if-error for the rule.
+	StaleIfErrorSeconds int `json:"stale_if_error_seconds,omitempty"`
+	// CacheKey, when configured, varies the cache key by specific query params,
+	// headers, and/or cookies instead of the default (method + full URI). Nil or
+	// empty preserves the current default behavior.
+	CacheKey *EdgeCacheKey `json:"cache_key,omitempty"`
+	// RequestCollapsing, when true, coalesces concurrent cache-miss fetches for
+	// the same key into a single origin request (the others wait for and share its
+	// response), so a cold key under a burst does not stampede the origin.
+	RequestCollapsing bool `json:"request_collapsing,omitempty"`
+}
+
+// EdgeCacheKey configures how the edge varies the cache key for a cache rule. By
+// default (an empty key) the edge keys cached entries by the request method and
+// the full URI; a configured key narrows or widens that by including only
+// specific query params and/or specific request headers and cookies. A nil or
+// empty key preserves the default behavior exactly.
+type EdgeCacheKey struct {
+	// VaryQueryParams, when non-empty, restricts the query-string contribution to
+	// the cache key to exactly these query parameter names (in the order given).
+	// Empty (the default) keeps the full query string in the key.
+	VaryQueryParams []string `json:"vary_query_params,omitempty"`
+	// VaryHeaders, when non-empty, adds these request header names' values to the
+	// cache key, so a response varies by them. Empty adds no header to the key.
+	VaryHeaders []string `json:"vary_headers,omitempty"`
+	// VaryCookies, when non-empty, adds these cookie names' values to the cache
+	// key, so a response varies by them. Empty adds no cookie to the key.
+	VaryCookies []string `json:"vary_cookies,omitempty"`
 }
 
 // EdgeRateLimit is a token bucket enforced per PoP at the edge. The
@@ -354,6 +390,225 @@ type EdgeBasicAuthRequest struct {
 	Accounts []EdgeBasicAuthAccountRequest `json:"accounts,omitempty"`
 }
 
+// EdgeJWTClaim is one required exact-match claim: when JWT validation is enabled
+// the validated token must carry a claim named Name whose value equals Value.
+type EdgeJWTClaim struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// EdgeJWTAuth requires a valid JWT on the matched paths at the edge. When
+// Enabled, the edge verifies the bearer token's signature against EITHER a JWKS
+// URL (fetched signing keys) OR a static set of PublicKeys (exactly one of the
+// two is configured), then enforces the optional Issuer, Audiences, and
+// RequiredClaims. A request without a valid JWT on a matched path is rejected
+// with a 401. When ForwardClaimsHeader is set, the edge forwards the validated
+// claims to the origin under that header. Nil or disabled performs no JWT
+// validation. JWKS URL and static public keys are public by nature, so this
+// carries no secret and is echoed verbatim on the settings response.
+type EdgeJWTAuth struct {
+	Enabled bool `json:"enabled"`
+	// Paths are the absolute path prefixes the JWT validation applies to. Empty
+	// (the default) applies it to all paths.
+	Paths []string `json:"paths,omitempty"`
+	// JWKSURL, when set, is the https URL the edge fetches signing keys from.
+	// Exactly one of JWKSURL / PublicKeys must be set when Enabled.
+	JWKSURL string `json:"jwks_url,omitempty"`
+	// PublicKeys, when set, are static signing keys (PEM-encoded public keys or
+	// JWK JSON). Exactly one of JWKSURL / PublicKeys must be set when Enabled.
+	PublicKeys []string `json:"public_keys,omitempty"`
+	// Issuer, when set, is the expected "iss" claim. Empty enforces no issuer.
+	Issuer string `json:"issuer,omitempty"`
+	// Audiences, when set, are the accepted "aud" values. Empty enforces no audience.
+	Audiences []string `json:"audiences,omitempty"`
+	// RequiredClaims, when set, are exact-match claims the token must carry.
+	RequiredClaims []EdgeJWTClaim `json:"required_claims,omitempty"`
+	// ForwardClaimsHeader, when set, is the request header the edge writes the
+	// validated claims to before forwarding to the origin. Empty forwards nothing.
+	ForwardClaimsHeader string `json:"forward_claims_header,omitempty"`
+}
+
+// EdgeSignedURLs requires a valid HMAC signature and unexpired link on the
+// matched paths at the edge. The signing secret VALUE is never carried in this
+// document: only SecretName (a reference to a separately configured secret) is
+// present, so the same shape serves the request and the settings response. Nil
+// or disabled performs no signature checking.
+type EdgeSignedURLs struct {
+	Enabled bool `json:"enabled"`
+	// Paths are the absolute path prefixes requiring a valid signature. Empty (the
+	// default) applies signature checking to all paths.
+	Paths []string `json:"paths,omitempty"`
+	// SecretName references the configured signing secret. The secret VALUE is
+	// resolved separately and never stored here. Required when Enabled.
+	SecretName string `json:"secret_name,omitempty"`
+	// TTLSeconds caps the maximum link age. 0 means no cap (the link's own exp
+	// governs).
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+	// SignatureParam is the query parameter carrying the HMAC signature. Empty
+	// defaults to "sig".
+	SignatureParam string `json:"signature_param,omitempty"`
+	// ExpiresParam is the query parameter carrying the link expiry (a unix
+	// timestamp). Empty defaults to "exp".
+	ExpiresParam string `json:"expires_param,omitempty"`
+}
+
+// EdgeAPIKeyLocation selects where the edge reads the API key from.
+type EdgeAPIKeyLocation string
+
+const (
+	// EdgeAPIKeyLocationHeader reads the key from a request header named KeyName.
+	EdgeAPIKeyLocationHeader EdgeAPIKeyLocation = "header"
+	// EdgeAPIKeyLocationQuery reads the key from a query parameter named KeyName.
+	EdgeAPIKeyLocationQuery EdgeAPIKeyLocation = "query"
+)
+
+// EdgeAPIKeyRequest is one inbound API key on the settings request. Key is the
+// PLAINTEXT key the controller hashes and discards (it is write-only and never
+// echoed). An empty Key for an existing key Name keeps that key's stored hash on
+// update. RateTier is the optional per-key rate limit.
+type EdgeAPIKeyRequest struct {
+	Name string `json:"name"`
+	// Key is the transient plaintext API key. The controller hashes it and never
+	// stores or logs it. An empty Key for an existing Name keeps that key's stored
+	// hash.
+	Key string `json:"key,omitempty"`
+	// RateTier is the optional per-key rate limit applied to requests
+	// authenticated with this key.
+	RateTier *EdgeRateLimit `json:"rate_tier,omitempty"`
+}
+
+// EdgeAPIKeyAuthRequest is the inbound API key setting on the settings request.
+// It carries plaintext keys that the controller hashes and discards; the stored
+// document only ever carries the resulting key hashes (never echoed back).
+type EdgeAPIKeyAuthRequest struct {
+	Enabled     bool                `json:"enabled"`
+	Paths       []string            `json:"paths,omitempty"`
+	KeyLocation EdgeAPIKeyLocation  `json:"key_location,omitempty"`
+	KeyName     string              `json:"key_name,omitempty"`
+	Keys        []EdgeAPIKeyRequest `json:"keys,omitempty"`
+}
+
+// EdgeAPIKeyView is the non-secret projection of one API key returned on the
+// settings response: the opaque Name and the optional per-key rate tier, never
+// the key hash or plaintext.
+type EdgeAPIKeyView struct {
+	Name     string         `json:"name"`
+	RateTier *EdgeRateLimit `json:"rate_tier,omitempty"`
+}
+
+// EdgeAPIKeyAuthView is the non-secret projection of the API key setting on the
+// settings response. It echoes the enabled flag, paths, location, key name, and
+// the per-key NAMES (with any rate tier), never any key hash or plaintext key.
+type EdgeAPIKeyAuthView struct {
+	Enabled     bool               `json:"enabled"`
+	Paths       []string           `json:"paths,omitempty"`
+	KeyLocation EdgeAPIKeyLocation `json:"key_location,omitempty"`
+	KeyName     string             `json:"key_name,omitempty"`
+	Keys        []EdgeAPIKeyView   `json:"keys,omitempty"`
+}
+
+// EdgeWAFExclusion removes a CRS rule (by RuleID) or a single target (for
+// example "ARGS:username") from inspection for one app, to suppress a known
+// false positive. At least one of RuleID / Target is set.
+type EdgeWAFExclusion struct {
+	// RuleID, when set, is the CRS rule id the exclusion applies to. 0 means "not
+	// set" (Target alone then applies the exclusion to all rules).
+	RuleID int `json:"rule_id,omitempty"`
+	// Target, when set, is the inspection target to exclude (for example
+	// "ARGS:username"). A bounded render-safe token.
+	Target string `json:"target,omitempty"`
+}
+
+// EdgeDDoSProfile is the per-app platform L4/L7 DDoS abuse profile. When
+// Enabled, the firewall and edge cap a single source's request rate, burst, and
+// concurrent connections. It is platform protection layered under the customer's
+// own EdgeRateLimit; the two are independent. Nil or disabled leaves only the
+// platform baseline.
+type EdgeDDoSProfile struct {
+	Enabled bool `json:"enabled"`
+	// PerIPRequestsPerSecond is the per-source request-rate cap. 0 applies the
+	// platform default.
+	PerIPRequestsPerSecond int `json:"per_ip_requests_per_second,omitempty"`
+	// PerIPBurst is the per-source burst allowance. 0 applies the platform default.
+	PerIPBurst int `json:"per_ip_burst,omitempty"`
+	// PerIPConnCap is the per-source concurrent L4 connection ceiling enforced at
+	// the firewall. 0 applies the platform default.
+	PerIPConnCap int `json:"per_ip_conn_cap,omitempty"`
+}
+
+// EdgeBotAction selects what bot management does with a request classified as a
+// bot.
+type EdgeBotAction string
+
+const (
+	// EdgeBotActionLog only logs a bot classification (never blocks).
+	EdgeBotActionLog EdgeBotAction = "log"
+	// EdgeBotActionBlock denies a request classified as a bad bot with a 403.
+	EdgeBotActionBlock EdgeBotAction = "block"
+	// EdgeBotActionChallenge is reserved for a future interactive challenge; until
+	// then the edge treats it as log.
+	EdgeBotActionChallenge EdgeBotAction = "challenge"
+)
+
+// EdgeBotManagement is the per-app bot management policy at the edge. When
+// Enabled, the edge classifies requests as bots (by known-bad-bot signatures
+// and/or a rate-based heuristic) and applies Action to a matched request. Nil or
+// disabled performs no bot classification.
+type EdgeBotManagement struct {
+	Enabled bool `json:"enabled"`
+	// Action is what to do with a request classified as a bad bot: log (default)
+	// or block. "challenge" is accepted as a reserved value but is deferred.
+	Action EdgeBotAction `json:"action,omitempty"`
+	// KnownBadBots enables matching against the platform's known-bad-bot signature set.
+	KnownBadBots bool `json:"known_bad_bots,omitempty"`
+	// RateBasedHeuristic enables a rate-based bot heuristic.
+	RateBasedHeuristic bool `json:"rate_based_heuristic,omitempty"`
+}
+
+// EdgeATOAction selects what account-takeover protection does when a detection
+// threshold is crossed.
+type EdgeATOAction string
+
+const (
+	// EdgeATOActionAlert raises an alert only (never throttles or locks). The safe
+	// default.
+	EdgeATOActionAlert EdgeATOAction = "alert"
+	// EdgeATOActionRateLimit throttles the offending source/username when the
+	// threshold is crossed.
+	EdgeATOActionRateLimit EdgeATOAction = "ratelimit"
+	// EdgeATOActionLock temporarily locks the offending source/username when the
+	// threshold is crossed.
+	EdgeATOActionLock EdgeATOAction = "lock"
+)
+
+// EdgeATOProtection is the per-app account-takeover protection setting. When
+// Enabled, the controller's ATO worker watches authentication attempts to
+// AuthPaths (failures counted by FailureStatusCodes) and, when a per-IP or
+// per-username failure rate crosses its threshold, applies Action. Nil or
+// disabled performs no ATO detection. The per-username dimension is active only
+// when both PerUsernameThresholdPerMin is positive and UsernameField is set.
+type EdgeATOProtection struct {
+	Enabled bool `json:"enabled"`
+	// AuthPaths are the absolute request paths the worker watches for auth
+	// attempts. Empty performs no detection.
+	AuthPaths []string `json:"auth_paths,omitempty"`
+	// FailureStatusCodes are the HTTP status codes counted as an authentication
+	// failure. Empty defaults to [401, 403].
+	FailureStatusCodes []int `json:"failure_status_codes,omitempty"`
+	// PerIPThresholdPerMin is the per-IP auth-failure rate (per minute) that
+	// crosses into Action. 0 disables the per-IP dimension.
+	PerIPThresholdPerMin int `json:"per_ip_threshold_per_min,omitempty"`
+	// PerUsernameThresholdPerMin is the per-username auth-failure rate (per minute)
+	// that crosses into Action. 0 disables the per-username dimension.
+	PerUsernameThresholdPerMin int `json:"per_username_threshold_per_min,omitempty"`
+	// UsernameField, when set, is the form or JSON field name the worker reads the
+	// attempted username from for per-username detection.
+	UsernameField string `json:"username_field,omitempty"`
+	// Action is what to do when a threshold is crossed: alert (default),
+	// ratelimit, or lock.
+	Action EdgeATOAction `json:"action,omitempty"`
+}
+
 // EdgeSettingsRequest is the customer-tunable subset of the edge config, written
 // via PUT /app-services/{id}/edge/settings. Domains and origin are
 // platform-derived and not settable here. Each list/pointer field replaces the
@@ -388,6 +643,29 @@ type EdgeSettingsRequest struct {
 	// Rules is the additive, ordered, composable rules engine list. It replaces
 	// the stored list wholesale; an empty list (or omitted) clears all rules.
 	Rules []EdgeRule `json:"rules,omitempty"`
+	// JWTAuth is the per-app edge JWT validation setting; nil clears it.
+	JWTAuth *EdgeJWTAuth `json:"jwt_auth,omitempty"`
+	// SignedURLs is the per-app edge signed-URL setting (secret referenced by
+	// name); nil clears it.
+	SignedURLs *EdgeSignedURLs `json:"signed_urls,omitempty"`
+	// APIKeyAuth is the per-app edge API key setting. It carries plaintext keys
+	// the controller hashes and discards; nil clears it.
+	APIKeyAuth *EdgeAPIKeyAuthRequest `json:"api_key_auth,omitempty"`
+	// WAFParanoiaLevel is the per-app OWASP CRS paranoia level (1..4); 0 means the
+	// platform default (PL1) applies.
+	WAFParanoiaLevel int `json:"waf_paranoia_level,omitempty"`
+	// WAFRuleExclusions is the per-app CRS rule/target exclusion list; empty means
+	// no exclusions.
+	WAFRuleExclusions []EdgeWAFExclusion `json:"waf_rule_exclusions,omitempty"`
+	// DDoSProfile is the per-app platform DDoS abuse profile; nil means only the
+	// platform baseline applies.
+	DDoSProfile *EdgeDDoSProfile `json:"ddos_profile,omitempty"`
+	// BotManagement is the per-app bot management setting; nil means no bot
+	// classification.
+	BotManagement *EdgeBotManagement `json:"bot_management,omitempty"`
+	// ATOProtection is the per-app account-takeover protection setting; nil means
+	// no ATO detection.
+	ATOProtection *EdgeATOProtection `json:"ato_protection,omitempty"`
 }
 
 // EdgeApplicationStatusItem is one PoP's convergence state.
@@ -439,8 +717,32 @@ type EdgeSettings struct {
 	CanaryRolloutEnabled bool `json:"canary_rollout_enabled"`
 	// Rules is the additive, ordered, composable rules engine list; empty means no
 	// rules.
-	Rules         []EdgeRule `json:"rules,omitempty"`
-	ConfigVersion int64      `json:"config_version"`
+	Rules []EdgeRule `json:"rules,omitempty"`
+	// JWTAuth is the per-app edge JWT validation setting echoed back; it carries
+	// no secret (only the JWKS URL or static public keys, which are public).
+	JWTAuth *EdgeJWTAuth `json:"jwt_auth,omitempty"`
+	// SignedURLs is the per-app edge signed-URL setting echoed back; the signing
+	// secret is referenced by name only and never echoed.
+	SignedURLs *EdgeSignedURLs `json:"signed_urls,omitempty"`
+	// APIKeyAuth is the non-secret projection of the per-app API key setting: key
+	// names and per-key rate tiers only, never any key hash or plaintext.
+	APIKeyAuth *EdgeAPIKeyAuthView `json:"api_key_auth,omitempty"`
+	// WAFParanoiaLevel is the per-app OWASP CRS paranoia level (1..4); 0 means the
+	// platform default (PL1) applies.
+	WAFParanoiaLevel int `json:"waf_paranoia_level,omitempty"`
+	// WAFRuleExclusions is the per-app CRS rule/target exclusion list; empty means
+	// no exclusions.
+	WAFRuleExclusions []EdgeWAFExclusion `json:"waf_rule_exclusions,omitempty"`
+	// DDoSProfile is the per-app platform DDoS abuse profile; nil means only the
+	// platform baseline applies.
+	DDoSProfile *EdgeDDoSProfile `json:"ddos_profile,omitempty"`
+	// BotManagement is the per-app bot management setting; nil means no bot
+	// classification.
+	BotManagement *EdgeBotManagement `json:"bot_management,omitempty"`
+	// ATOProtection is the per-app account-takeover protection setting; nil means
+	// no ATO detection.
+	ATOProtection *EdgeATOProtection `json:"ato_protection,omitempty"`
+	ConfigVersion int64              `json:"config_version"`
 }
 
 // listEdgeDomainsResponse wraps the list-domains response envelope.
