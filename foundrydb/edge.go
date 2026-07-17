@@ -1342,3 +1342,349 @@ func (c *Client) AbortAppEdgeRollout(ctx context.Context, appServiceID string, r
 	}
 	return nil
 }
+
+// -----------------------------------------------------------------------------
+// Edge fleet administration (admin only)
+//
+// The platform-owned edge gateway PoPs (points of presence) are created,
+// scaled, rolled, and retired only through these admin endpoints under
+// /admin/edge. The edge state machine handles everything in between. A PoP is
+// one edge service with node_count >= 2 (a primary that holds the serving
+// floating IP plus one or more hot standbys), giving in-house intra-PoP high
+// availability via floating-IP handoff on failure.
+// -----------------------------------------------------------------------------
+
+// EdgeNode is the admin-facing shape of one edge PoP. NodeCount and
+// TargetNodeCount expose the PoP's primary-plus-standby sizing for HA.
+type EdgeNode struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Zone            string `json:"zone"`
+	PlanName        string `json:"plan_name"`
+	Status          string `json:"status"`
+	NodeCount       int    `json:"node_count"`
+	TargetNodeCount int    `json:"target_node_count"`
+}
+
+// CreateEdgeNodeRequest provisions one new edge PoP via
+// POST /admin/edge/nodes. Zone is required; the service name is derived.
+// NodeCount optionally widens the PoP beyond the default primary-plus-standby
+// pair; values below the default are raised to it.
+type CreateEdgeNodeRequest struct {
+	Zone      string `json:"zone"`
+	PlanName  string `json:"plan_name,omitempty"`
+	NodeCount int    `json:"node_count,omitempty"`
+}
+
+// EdgeNodeScaleRequest sets an edge PoP's desired VM count via
+// PATCH /admin/edge/nodes/{nodeId}. NodeCount must be at least 1; 2 or more
+// keeps the PoP highly available.
+type EdgeNodeScaleRequest struct {
+	NodeCount int `json:"node_count"`
+}
+
+// listEdgeNodesResponse wraps the admin list-nodes envelope.
+type listEdgeNodesResponse struct {
+	Nodes []EdgeNode `json:"nodes"`
+}
+
+// CreateEdgeNode provisions a new edge PoP in the requested zone (admin only).
+// The edge state machine drives it from Pending to Running; poll ListEdgeNodes
+// for status.
+func (c *Client) CreateEdgeNode(ctx context.Context, req CreateEdgeNodeRequest) (*EdgeNode, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/admin/edge/nodes", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var node EdgeNode
+	if err := json.Unmarshal(data, &node); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode CreateEdgeNode response: %w", err)
+	}
+	return &node, nil
+}
+
+// ListEdgeNodes returns the live edge fleet (admin only).
+func (c *Client) ListEdgeNodes(ctx context.Context) ([]EdgeNode, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/admin/edge/nodes", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out listEdgeNodesResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListEdgeNodes response: %w", err)
+	}
+	return out.Nodes, nil
+}
+
+// ScaleEdgeNode sets an edge PoP's desired VM count (admin only), backfilling
+// standbys to scale up or retiring the newest standbys (never the primary) to
+// scale down. The PoP must be Running; the change converges asynchronously.
+// Returns on a 202 Accepted (no body).
+func (c *Client) ScaleEdgeNode(ctx context.Context, nodeID string, req EdgeNodeScaleRequest) error {
+	resp, err := c.do(ctx, http.MethodPatch, "/admin/edge/nodes/"+nodeID, req, "")
+	if err != nil {
+		return err
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// DeleteEdgeNode queues an edge PoP for deletion through the standard deletion
+// states (admin only). The node is removed asynchronously.
+func (c *Client) DeleteEdgeNode(ctx context.Context, nodeID string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/admin/edge/nodes/"+nodeID, nil, "")
+	if err != nil {
+		return err
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// EdgeRollStatus reports an edge PoP's image-roll progress. InProgress is true
+// while any node still predates the roll request; RemainingOldNodes counts
+// those old running nodes and ReplacedNodes counts the running nodes already on
+// the new image.
+type EdgeRollStatus struct {
+	InProgress        bool    `json:"in_progress"`
+	RequestedAt       *string `json:"requested_at,omitempty"`
+	TargetNodes       int     `json:"target_nodes"`
+	RunningNodes      int     `json:"running_nodes"`
+	RemainingOldNodes int     `json:"remaining_old_nodes"`
+	ReplacedNodes     int     `json:"replaced_nodes"`
+}
+
+// StartEdgeRoll begins a graceful, one-node-at-a-time roll of an edge PoP onto
+// the current active base template (admin only). It composes the existing
+// decommission, backfill, and floating-IP failover primitives so the PoP keeps
+// serving throughout. The PoP must be Running and settled (all nodes healthy,
+// none provisioning or decommissioning) or the call is rejected. It is
+// idempotent: if a roll is already in progress it returns the current status
+// instead of starting a second one. Returns the roll status.
+func (c *Client) StartEdgeRoll(ctx context.Context, nodeID string) (*EdgeRollStatus, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/admin/edge/nodes/"+nodeID+"/roll", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var status EdgeRollStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode StartEdgeRoll response: %w", err)
+	}
+	return &status, nil
+}
+
+// GetEdgeRoll reports an edge PoP's current roll progress (admin only).
+func (c *Client) GetEdgeRoll(ctx context.Context, nodeID string) (*EdgeRollStatus, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/admin/edge/nodes/"+nodeID+"/roll", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var status EdgeRollStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetEdgeRoll response: %w", err)
+	}
+	return &status, nil
+}
+
+// CancelEdgeRoll clears an edge PoP's roll marker so the reconciler stops
+// retiring further nodes (admin only). Any in-flight replacement completes
+// normally. Returns on a 204 No Content.
+func (c *Client) CancelEdgeRoll(ctx context.Context, nodeID string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/admin/edge/nodes/"+nodeID+"/roll", nil, "")
+	if err != nil {
+		return err
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// EdgeAutoscaleConfig is the static edge autoscale policy (display only). None
+// of these values feeds a live scaling decision from the overview endpoint.
+type EdgeAutoscaleConfig struct {
+	Enabled         bool    `json:"enabled"`
+	MaxNodes        int     `json:"max_nodes"`
+	ScaleUpRPS      float64 `json:"scale_up_rps"`
+	ScaleDownRPS    float64 `json:"scale_down_rps"`
+	CooldownSeconds int     `json:"cooldown_seconds"`
+	LookbackSeconds int     `json:"lookback_seconds"`
+}
+
+// EdgeAutoscaleState is per-PoP autoscale telemetry for display; it never
+// influences scaling. It is present only when current load or an autoscaler
+// evaluation is available.
+type EdgeAutoscaleState struct {
+	CurrentRPS               float64 `json:"current_rps"`
+	PerNodeRPS               float64 `json:"per_node_rps"`
+	LastDecision             string  `json:"last_decision"`
+	LastActionAt             *string `json:"last_action_at"`
+	CooldownRemainingSeconds int     `json:"cooldown_remaining_seconds"`
+}
+
+// EdgeOverviewNode is one VM in an edge PoP. IsServing marks the node currently
+// holding the serving floating IP.
+type EdgeOverviewNode struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Status    string `json:"status"`
+	IsServing bool   `json:"is_serving"`
+}
+
+// EdgeRecoveryStatus summarizes an in-flight HA auto-recovery cycle for a PoP
+// (self-heal replacement, failover, scale-out). Present on an overview row only
+// while recovery is active.
+type EdgeRecoveryStatus struct {
+	InProgress   bool    `json:"in_progress"`
+	Phase        string  `json:"phase,omitempty"`
+	StartedAt    *string `json:"started_at,omitempty"`
+	EstimatedETA *string `json:"estimated_eta,omitempty"`
+}
+
+// EdgeOverviewPoP is one PoP row of the edge overview: its node roster, serving
+// floating IP, node deficit, in-flight recovery status, and current load.
+type EdgeOverviewPoP struct {
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	Zone            string              `json:"zone"`
+	PlanName        string              `json:"plan_name"`
+	Status          string              `json:"status"`
+	NodeCount       int                 `json:"node_count"`
+	TargetNodeCount int                 `json:"target_node_count"`
+	Deficit         int                 `json:"deficit"`
+	ServingFIP      *string             `json:"serving_fip"`
+	Recovery        *EdgeRecoveryStatus `json:"recovery"`
+	Nodes           []EdgeOverviewNode  `json:"nodes"`
+	AutoscaleState  *EdgeAutoscaleState `json:"autoscale_state"`
+}
+
+// EdgeOverview is the GET /admin/edge/overview response: one consolidated,
+// read-only snapshot of the edge fleet for the admin console (the static
+// autoscale policy plus one row per PoP).
+type EdgeOverview struct {
+	Autoscale EdgeAutoscaleConfig `json:"autoscale"`
+	PoPs      []EdgeOverviewPoP   `json:"pops"`
+}
+
+// GetEdgeOverview returns the consolidated read-only edge fleet snapshot (admin
+// only): the autoscale policy plus one row per PoP with its node roster,
+// serving floating IP, node deficit, in-flight recovery status, and load.
+func (c *Client) GetEdgeOverview(ctx context.Context) (*EdgeOverview, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/admin/edge/overview", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeOverview
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetEdgeOverview response: %w", err)
+	}
+	return &out, nil
+}
+
+// EdgeRecoveryByKind aggregates HA recovery activity for one service kind.
+type EdgeRecoveryByKind struct {
+	ServiceKind        string  `json:"service_kind"`
+	Attempts           int     `json:"attempts"`
+	Errors             int     `json:"errors"`
+	AvgDurationSeconds float64 `json:"avg_duration_seconds"`
+}
+
+// EdgeRecoveryDeficit is one service's current node deficit.
+type EdgeRecoveryDeficit struct {
+	ServiceID string  `json:"service_id"`
+	Deficit   float64 `json:"deficit"`
+}
+
+// EdgeReconcilerTicks summarizes the failed-node reconciler loop counters.
+type EdgeReconcilerTicks struct {
+	Scanned         int `json:"scanned"`
+	CandidatesFound int `json:"candidates_found"`
+	QueryFailed     int `json:"query_failed"`
+}
+
+// EdgeRecovery is the GET /admin/edge/recovery response: a snapshot of the
+// shared HA recovery telemetry read from the in-process metrics gatherer.
+type EdgeRecovery struct {
+	ByKind           []EdgeRecoveryByKind  `json:"by_kind"`
+	DeficitByService []EdgeRecoveryDeficit `json:"deficit_by_service"`
+	ReconcilerTicks  EdgeReconcilerTicks   `json:"reconciler_ticks"`
+}
+
+// GetEdgeRecovery returns a snapshot of the shared HA recovery telemetry (admin
+// only): recovery attempts, errors, and average duration per service kind; the
+// failed-node reconciler loop counters; and the per-service node deficit.
+func (c *Client) GetEdgeRecovery(ctx context.Context) (*EdgeRecovery, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/admin/edge/recovery", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeRecovery
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetEdgeRecovery response: %w", err)
+	}
+	return &out, nil
+}
+
+// EdgeRouteApp is one app routed through the edge, with the PoP zone it is
+// served from and its measured request rate over the window. RequestsPerSec is
+// zero for a linked-but-idle app.
+type EdgeRouteApp struct {
+	ServiceID      string  `json:"service_id"`
+	Name           string  `json:"name"`
+	Status         string  `json:"status"`
+	Zone           string  `json:"zone"`
+	RequestsPerSec float64 `json:"requests_per_sec"`
+}
+
+// EdgeRoutes is the GET /admin/edge/routes response: the apps currently routed
+// through the edge and their per-PoP request rate, ordered busiest first.
+type EdgeRoutes struct {
+	WindowMinutes int            `json:"window_minutes"`
+	Apps          []EdgeRouteApp `json:"apps"`
+}
+
+// GetEdgeRoutes returns the live edge routing topology (admin only): the apps
+// routed through the edge and their measured per-PoP request rate. Pass
+// windowMinutes to set the aggregation window (0 uses the server default of 5
+// minutes; values above 1440 are clamped server-side).
+func (c *Client) GetEdgeRoutes(ctx context.Context, windowMinutes int) (*EdgeRoutes, error) {
+	path := "/admin/edge/routes"
+	if windowMinutes > 0 {
+		path += "?window_minutes=" + strconv.Itoa(windowMinutes)
+	}
+	resp, err := c.do(ctx, http.MethodGet, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeRoutes
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetEdgeRoutes response: %w", err)
+	}
+	return &out, nil
+}
