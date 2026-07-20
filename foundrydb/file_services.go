@@ -46,10 +46,52 @@ type FilesConfig struct {
 	LifecycleEnabled bool `json:"lifecycle_enabled"`
 	// MeasuredBytes is the bucket size from the most recent usage poll.
 	MeasuredBytes int64 `json:"measured_bytes"`
+	// MeasuredObjects is the object count from the most recent usage poll.
+	MeasuredObjects int64 `json:"measured_objects"`
 	// MeasuredAt is when MeasuredBytes was captured; nil before the first poll.
 	MeasuredAt *time.Time `json:"measured_at,omitempty"`
 	// OverQuota reports whether the measured usage exceeds the hard quota.
 	OverQuota bool `json:"over_quota"`
+}
+
+// FilesUsagePoint is one time-bucketed sample of a files service's storage
+// footprint: the peak stored bytes and object count in that window.
+type FilesUsagePoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Bytes     int64     `json:"bytes"`
+	Objects   int64     `json:"objects"`
+}
+
+// FilesUsageCurrent is the point-in-time storage footprint of a files service.
+// Live is true when the figures came from an on-demand provider read rather
+// than the last metering tick.
+type FilesUsageCurrent struct {
+	Bytes          int64      `json:"bytes"`
+	Objects        int64      `json:"objects"`
+	MeasuredAt     *time.Time `json:"measured_at,omitempty"`
+	Live           bool       `json:"live"`
+	MonthlyCostEUR float64    `json:"monthly_cost_eur"`
+}
+
+// FilesUsage is the storage-monitoring payload for a files service: the current
+// footprint plus a storage-over-time series at the returned granularity.
+type FilesUsage struct {
+	Current     FilesUsageCurrent `json:"current"`
+	Series      []FilesUsagePoint `json:"series"`
+	Granularity string            `json:"granularity"`
+}
+
+// FilesUsageOptions parameterizes a usage query. All fields are optional.
+type FilesUsageOptions struct {
+	// Range is the history window, e.g. "30d" or "24h" (default "30d", capped
+	// at the 730-day retention horizon).
+	Range string
+	// Granularity buckets the series by "hour" or "day"; empty auto-selects by
+	// window (hourly for windows up to 3 days, daily beyond).
+	Granularity string
+	// Live requests an on-demand read of the current footprint from the object
+	// storage provider instead of the last metering tick.
+	Live bool
 }
 
 // FilesService is a managed object storage bucket service: an S3-compatible
@@ -102,8 +144,12 @@ type FilesAccessKey struct {
 	// the whole bucket.
 	Prefix string `json:"prefix"`
 	// Permissions is the access level the key grants: "read", "write", or
-	// "readwrite".
+	// "readwrite". Empty for keys minted from a custom InlinePolicy.
 	Permissions string `json:"permissions"`
+	// InlinePolicy is the custom policy the key was minted with, when it was
+	// created from a structured statement list rather than the prefix +
+	// permission shorthand. Nil for shorthand keys.
+	InlinePolicy *FilesKeyPolicy `json:"inline_policy,omitempty"`
 	// Purpose records why the key exists: "user" for customer-managed keys,
 	// "attachment" for keys minted automatically for an app attachment.
 	Purpose string `json:"purpose"`
@@ -115,14 +161,40 @@ type FilesAccessKey struct {
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
-// CreateFilesAccessKeyRequest is the body for CreateFilesAccessKey.
+// FilesPolicyStatement is one statement of a custom inline access-key policy.
+// The client controls the effect, the S3 actions, and the object-key prefixes;
+// the platform always constructs the resource ARNs scoped to the key's own
+// bucket, so a statement can never reach another tenant's data.
+type FilesPolicyStatement struct {
+	// Effect is "Allow" or "Deny".
+	Effect string `json:"effect"`
+	// Actions are S3 data-plane actions (e.g. "s3:GetObject", "s3:PutObject",
+	// "s3:ListBucket"). Restricted to a data-action allowlist server-side.
+	Actions []string `json:"actions"`
+	// Prefixes are object key prefixes within the bucket this statement applies
+	// to. Empty applies to the whole bucket.
+	Prefixes []string `json:"prefixes,omitempty"`
+}
+
+// FilesKeyPolicy is a custom inline policy attached to one access key.
+type FilesKeyPolicy struct {
+	Statements []FilesPolicyStatement `json:"statements"`
+}
+
+// CreateFilesAccessKeyRequest is the body for CreateFilesAccessKey. Scope the
+// key with either the Prefix + Permissions shorthand or a custom Policy; the
+// two are mutually exclusive.
 type CreateFilesAccessKeyRequest struct {
 	Name string `json:"name"`
 	// Prefix scopes the key to an object key prefix; empty grants the whole
-	// bucket.
+	// bucket. Ignored when Policy is set.
 	Prefix string `json:"prefix,omitempty"`
-	// Permissions is "read", "write", or "readwrite".
-	Permissions string `json:"permissions"`
+	// Permissions is "read", "write", or "readwrite". Required unless Policy is
+	// set.
+	Permissions string `json:"permissions,omitempty"`
+	// Policy is a custom inline policy compiled into a bucket-scoped IAM
+	// document. Mutually exclusive with Prefix + Permissions.
+	Policy *FilesKeyPolicy `json:"policy,omitempty"`
 }
 
 // FilesAccessKeyWithSecret is the CreateFilesAccessKey response. The secret is
@@ -216,6 +288,43 @@ func (c *Client) GetFilesService(ctx context.Context, id string) (*FilesService,
 		return nil, fmt.Errorf("foundrydb: decode GetFilesService response: %w", err)
 	}
 	return &service, nil
+}
+
+// GetFilesUsage returns a files service's storage-monitoring data: the current
+// footprint (stored bytes, object count, monthly cost) and a storage-over-time
+// series. Pass opts to set the history window, bucket granularity, or request a
+// live on-demand read. Pass nil for the defaults (30-day window, auto
+// granularity, last metering tick).
+func (c *Client) GetFilesUsage(ctx context.Context, id string, opts *FilesUsageOptions) (*FilesUsage, error) {
+	path := "/file-services/" + id + "/usage"
+	if opts != nil {
+		q := url.Values{}
+		if opts.Range != "" {
+			q.Set("range", opts.Range)
+		}
+		if opts.Granularity != "" {
+			q.Set("granularity", opts.Granularity)
+		}
+		if opts.Live {
+			q.Set("live", "true")
+		}
+		if encoded := q.Encode(); encoded != "" {
+			path += "?" + encoded
+		}
+	}
+	resp, err := c.do(ctx, http.MethodGet, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var usage FilesUsage
+	if err := json.Unmarshal(data, &usage); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetFilesUsage response: %w", err)
+	}
+	return &usage, nil
 }
 
 // CreateFilesService provisions a new files service (an S3-compatible bucket)
