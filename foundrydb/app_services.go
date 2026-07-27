@@ -149,6 +149,11 @@ type AppService struct {
 	AllowedCIDRs       []string            `json:"allowed_cidrs,omitempty"`
 	AppConfig          *AppContainerConfig `json:"app_config,omitempty"`
 	AttachedServiceIDs []string            `json:"attached_service_ids,omitempty"`
+	// URL is the app's public HTTPS address. The API returns it on every read;
+	// it is the one thing a caller almost always wants immediately after a
+	// deploy, so leaving it unmodelled forced every consumer to re-derive the
+	// hostname or drop back to raw HTTP.
+	URL string `json:"url,omitempty"`
 	CreatedAt          string              `json:"created_at"`
 	UpdatedAt          string              `json:"updated_at"`
 }
