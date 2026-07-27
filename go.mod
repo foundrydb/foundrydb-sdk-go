@@ -1,3 +1,3 @@
-module github.com/anorph/foundrydb-sdk-go
+module github.com/foundrydb/foundrydb-sdk-go
 
 go 1.21

@@ -206,6 +206,48 @@ type CreateBackupRequest struct {
 	BackupType BackupType `json:"backup_type,omitempty"`
 }
 
+// BackupDestinationProvider identifies the object-storage provider kind for a
+// per-service backup destination.
+type BackupDestinationProvider string
+
+const (
+	// BackupDestinationProviderS3 is any S3-compatible object storage endpoint
+	// (AWS S3, UpCloud Object Storage, MinIO, etc.).
+	BackupDestinationProviderS3 BackupDestinationProvider = "s3"
+)
+
+// BackupDestination is a per-service "bring your own bucket" (BYOB) backup
+// destination. When Enabled, the service's scheduled/manual backups and PITR
+// restores target this customer-owned bucket instead of the platform bucket.
+// The secret access key is never returned by the API.
+type BackupDestination struct {
+	ID          string                    `json:"id"`
+	ServiceID   string                    `json:"service_id"`
+	Provider    BackupDestinationProvider `json:"provider"`
+	Endpoint    string                    `json:"endpoint"`
+	Region      string                    `json:"region"`
+	Bucket      string                    `json:"bucket"`
+	PathPrefix  string                    `json:"path_prefix"`
+	AccessKeyID string                    `json:"access_key_id"`
+	Enabled     bool                      `json:"enabled"`
+	CreatedAt   string                    `json:"created_at"`
+	UpdatedAt   string                    `json:"updated_at"`
+}
+
+// SetBackupDestinationRequest is the request body for PUT
+// /managed-services/{id}/backup-destination. It configures (or replaces) the
+// per-service BYOB backup destination.
+type SetBackupDestinationRequest struct {
+	Provider        BackupDestinationProvider `json:"provider,omitempty"` // defaults to "s3"
+	Endpoint        string                    `json:"endpoint"`
+	Region          string                    `json:"region,omitempty"`
+	Bucket          string                    `json:"bucket"`
+	PathPrefix      string                    `json:"path_prefix,omitempty"`
+	AccessKeyID     string                    `json:"access_key_id"`
+	SecretAccessKey string                    `json:"secret_access_key"`
+	Enabled         *bool                     `json:"enabled,omitempty"` // defaults to true
+}
+
 // ControlAssertion describes a single control assertion within a compliance evidence packet.
 type ControlAssertion struct {
 	ControlID    string   `json:"control_id"`

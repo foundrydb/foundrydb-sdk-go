@@ -24,6 +24,14 @@ type StackCostLineItem struct {
 	// IsCeiling marks a line that is a maximum charge (for example an inference
 	// budget), not a fixed recurring cost. The UI should label it accordingly.
 	IsCeiling bool `json:"is_ceiling,omitempty"`
+	// AppKind is the concrete app identity of an app-kind line item: the
+	// companion slug (e.g. "metabase", "directus", "hasura", "open-webui") or a
+	// slug derived from the container image repo name. Omitted for non-app lines.
+	AppKind string `json:"app_kind,omitempty"`
+	// Engine is the database engine of a database-kind line item (e.g.
+	// "postgresql", "mysql", "mongodb", "valkey", "kafka"). Omitted for
+	// non-database lines.
+	Engine string `json:"engine,omitempty"`
 }
 
 // StackCostPreview is the per-month cost estimate for a stack template.
@@ -109,6 +117,11 @@ type StackPreviewRequest struct {
 	// TemplateID selects a customer-authored marketplace template. Use this
 	// instead of TemplateName when previewing a marketplace template.
 	TemplateID string `json:"template_id,omitempty"`
+	// Overrides optionally adjusts per-resource spec fields by symbolic name
+	// (e.g. {"db": {"storage_size_gb": 100}}). The estimate reflects the merged
+	// descriptor, so preview with the same overrides you launch with and the cost
+	// gate will agree. Unknown or out-of-bounds keys are rejected.
+	Overrides map[string]map[string]any `json:"overrides,omitempty"`
 }
 
 // StackLaunchRequest is the body for LaunchStack.
@@ -134,180 +147,6 @@ type StackLaunchRequest struct {
 	// Overrides optionally adjusts per-resource spec fields by symbolic name
 	// (e.g. bump the db plan_name). Unknown keys are rejected.
 	Overrides map[string]map[string]any `json:"overrides,omitempty"`
-}
-
-type listStackTemplatesResponse struct {
-	Templates []StackTemplateSummary `json:"templates"`
-}
-
-// ListStackTemplates returns the first-party stack catalog. Each entry
-// includes a fresh cost preview reflecting current plan prices.
-func (c *Client) ListStackTemplates(ctx context.Context) ([]StackTemplateSummary, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates", nil, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var result listStackTemplatesResponse
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode ListStackTemplates response: %w", err)
-	}
-	return result.Templates, nil
-}
-
-// PreviewStackCost computes and returns the estimated monthly cost for launching
-// a stack from the named template. Call this before LaunchStack and pass the
-// returned MonthlyTotal as AcceptedMonthlyCost to satisfy the cost gate.
-func (c *Client) PreviewStackCost(ctx context.Context, req StackPreviewRequest) (*StackCostPreview, error) {
-	resp, err := c.do(ctx, http.MethodPost, "/stacks/preview", req, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var preview StackCostPreview
-	if err := json.Unmarshal(data, &preview); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode PreviewStackCost response: %w", err)
-	}
-	return &preview, nil
-}
-
-// LaunchStack provisions a stack from a catalog template and returns its initial
-// state. The stack is created in Pending; use WaitForStackRunning to block until
-// all child resources are wired and the endpoint is live.
-//
-// AcceptedMonthlyCost in req must match the estimate from a prior
-// PreviewStackCost call within $0.01; a material drift returns an APIError with
-// status 409. The owning organization must have an enabled inference provider
-// when the template composes inference; a missing provider returns 400.
-func (c *Client) LaunchStack(ctx context.Context, req StackLaunchRequest) (*Stack, error) {
-	resp, err := c.do(ctx, http.MethodPost, "/stacks", req, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var stack Stack
-	if err := json.Unmarshal(data, &stack); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode LaunchStack response: %w", err)
-	}
-	return &stack, nil
-}
-
-type listStacksResponse struct {
-	Stacks []Stack `json:"stacks"`
-}
-
-// ListStacks returns all stacks visible to the authenticated user.
-func (c *Client) ListStacks(ctx context.Context) ([]Stack, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/stacks", nil, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var result listStacksResponse
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode ListStacks response: %w", err)
-	}
-	return result.Stacks, nil
-}
-
-// GetStack returns the stack with the given UUID, including its child
-// resources. Returns nil, nil when it does not exist (404).
-func (c *Client) GetStack(ctx context.Context, id string) (*Stack, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/stacks/"+id, nil, "")
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
-		return nil, nil
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var stack Stack
-	if err := json.Unmarshal(data, &stack); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode GetStack response: %w", err)
-	}
-	return &stack, nil
-}
-
-// DeleteStack initiates atomic teardown of the stack. The reconciler removes
-// every child resource before settling on Deleted. A 404 response is treated
-// as success (idempotent).
-func (c *Client) DeleteStack(ctx context.Context, id string) error {
-	resp, err := c.do(ctx, http.MethodDelete, "/stacks/"+id, nil, "")
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
-		return nil
-	}
-	_, err = checkResponse(resp)
-	return err
-}
-
-// RetryStack resets a Failed stack to Pending and re-runs provisioning from
-// the beginning. A failed stack has already rolled back all child resources, so
-// retry provisions fresh. Returns an APIError with status 409 when the stack is
-// not in the Failed state.
-func (c *Client) RetryStack(ctx context.Context, id string) error {
-	resp, err := c.do(ctx, http.MethodPost, "/stacks/"+id+"/retry", nil, "")
-	if err != nil {
-		return err
-	}
-	_, err = checkResponse(resp)
-	return err
-}
-
-// WaitForStackRunning polls the stack until it reaches "Running" status or the
-// timeout expires. Polling interval is 10 seconds (stack provisioning composes
-// multiple child resources and takes several minutes). The context deadline (if
-// any) takes precedence over timeout. Returns an error immediately when the
-// stack enters a terminal failure state.
-func (c *Client) WaitForStackRunning(ctx context.Context, id string, timeout time.Duration) (*Stack, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		stack, err := c.GetStack(ctx, id)
-		if err != nil {
-			return nil, fmt.Errorf("foundrydb: polling stack %s: %w", id, err)
-		}
-		if stack == nil {
-			return nil, fmt.Errorf("foundrydb: stack %s not found while waiting for running status", id)
-		}
-
-		status := strings.ToLower(stack.Status)
-		if status == "running" {
-			return stack, nil
-		}
-		if strings.Contains(status, "failed") || status == "deleted" {
-			return nil, fmt.Errorf("foundrydb: stack %s entered terminal status %q", id, stack.Status)
-		}
-
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("foundrydb: timed out after %s waiting for stack %s to reach running status (current: %s)",
-				timeout, id, stack.Status)
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
-	}
 }
 
 // StackVisibility controls who can discover and launch a custom template.
@@ -494,6 +333,145 @@ type StackMigration struct {
 	CreatedAt           time.Time            `json:"created_at"`
 	UpdatedAt           time.Time            `json:"updated_at"`
 }
+
+type listStackTemplatesResponse struct {
+	Templates []StackTemplateSummary `json:"templates"`
+}
+
+// ListStackTemplates returns the first-party stack catalog. Each entry
+// includes a fresh cost preview reflecting current plan prices.
+func (c *Client) ListStackTemplates(ctx context.Context) ([]StackTemplateSummary, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/templates", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result listStackTemplatesResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListStackTemplates response: %w", err)
+	}
+	return result.Templates, nil
+}
+
+// PreviewStackCost computes and returns the estimated monthly cost for launching
+// a stack from the named template. Call this before LaunchStack and pass the
+// returned MonthlyTotal as AcceptedMonthlyCost to satisfy the cost gate.
+func (c *Client) PreviewStackCost(ctx context.Context, req StackPreviewRequest) (*StackCostPreview, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/preview", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var preview StackCostPreview
+	if err := json.Unmarshal(data, &preview); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode PreviewStackCost response: %w", err)
+	}
+	return &preview, nil
+}
+
+// LaunchStack provisions a stack from a catalog template and returns its initial
+// state. The stack is created in Pending; use WaitForStackRunning to block until
+// all child resources are wired and the endpoint is live.
+//
+// AcceptedMonthlyCost in req must match the estimate from a prior
+// PreviewStackCost call within $0.01; a material drift returns an APIError with
+// status 409. The owning organization must have an enabled inference provider
+// when the template composes inference; a missing provider returns 400.
+func (c *Client) LaunchStack(ctx context.Context, req StackLaunchRequest) (*Stack, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var stack Stack
+	if err := json.Unmarshal(data, &stack); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode LaunchStack response: %w", err)
+	}
+	return &stack, nil
+}
+
+type listStacksResponse struct {
+	Stacks []Stack `json:"stacks"`
+}
+
+// ListStacks returns all stacks visible to the authenticated user.
+func (c *Client) ListStacks(ctx context.Context) ([]Stack, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var result listStacksResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListStacks response: %w", err)
+	}
+	return result.Stacks, nil
+}
+
+// GetStack returns the stack with the given UUID, including its child
+// resources. Returns nil, nil when it does not exist (404).
+func (c *Client) GetStack(ctx context.Context, id string) (*Stack, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/stacks/"+id, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil, nil
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var stack Stack
+	if err := json.Unmarshal(data, &stack); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetStack response: %w", err)
+	}
+	return &stack, nil
+}
+
+// DeleteStack initiates atomic teardown of the stack. The reconciler removes
+// every child resource before settling on Deleted. A 404 response is treated
+// as success (idempotent).
+func (c *Client) DeleteStack(ctx context.Context, id string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/stacks/"+id, nil, "")
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return nil
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// RetryStack resets a Failed stack to Pending and re-runs provisioning from
+// the beginning. A failed stack has already rolled back all child resources, so
+// retry provisions fresh. Returns an APIError with status 409 when the stack is
+// not in the Failed state.
+func (c *Client) RetryStack(ctx context.Context, id string) error {
+	resp, err := c.do(ctx, http.MethodPost, "/stacks/"+id+"/retry", nil, "")
+	if err != nil {
+		return err
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
+// --- Custom template authoring ---
 
 type listCustomTemplatesResponse struct {
 	Templates []CustomStackTemplate `json:"templates"`
@@ -703,4 +681,41 @@ func (c *Client) ApplyStackUpgrade(ctx context.Context, stackID string, req Stac
 		return nil, fmt.Errorf("foundrydb: decode ApplyStackUpgrade response: %w", err)
 	}
 	return &mig, nil
+}
+
+// WaitForStackRunning polls the stack until it reaches "Running" status or the
+// timeout expires. Polling interval is 10 seconds (stack provisioning composes
+// multiple child resources and takes several minutes). The context deadline (if
+// any) takes precedence over timeout. Returns an error immediately when the
+// stack enters a terminal failure state.
+func (c *Client) WaitForStackRunning(ctx context.Context, id string, timeout time.Duration) (*Stack, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		stack, err := c.GetStack(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("foundrydb: polling stack %s: %w", id, err)
+		}
+		if stack == nil {
+			return nil, fmt.Errorf("foundrydb: stack %s not found while waiting for running status", id)
+		}
+
+		status := strings.ToLower(stack.Status)
+		if status == "running" {
+			return stack, nil
+		}
+		if strings.Contains(status, "failed") || status == "deleted" {
+			return nil, fmt.Errorf("foundrydb: stack %s entered terminal status %q", id, stack.Status)
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("foundrydb: timed out after %s waiting for stack %s to reach running status (current: %s)",
+				timeout, id, stack.Status)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
+	}
 }

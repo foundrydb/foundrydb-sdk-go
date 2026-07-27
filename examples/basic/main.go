@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/anorph/foundrydb-sdk-go/foundrydb"
+	"github.com/foundrydb/foundrydb-sdk-go/foundrydb"
 )
 
 func main() {

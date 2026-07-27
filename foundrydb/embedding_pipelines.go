@@ -56,11 +56,25 @@ type EmbeddingPipeline struct {
 
 // CreateEmbeddingPipelineRequest is the body for CreateEmbeddingPipeline.
 type CreateEmbeddingPipelineRequest struct {
-	DatabaseName        string                 `json:"database_name"`
-	SourceSchema        string                 `json:"source_schema,omitempty"`
-	SourceTable         string                 `json:"source_table"`
-	TextColumns         []string               `json:"text_columns"`
-	ModelProvider       string                 `json:"model_provider"`
+	DatabaseName string `json:"database_name"`
+	// SourceType selects where the text comes from: "table" (default) embeds
+	// rows of a SQL table's TextColumns; "files" embeds unstructured .txt/.md
+	// documents from a Files bucket (chunked, then embedded). Empty defaults to
+	// "table".
+	SourceType   string   `json:"source_type,omitempty"`
+	SourceSchema string   `json:"source_schema,omitempty"`
+	SourceTable  string   `json:"source_table,omitempty"` // required for source_type=table
+	TextColumns  []string `json:"text_columns,omitempty"` // required for source_type=table
+	// Files-source fields (source_type=files). Documents under FilesPrefix in
+	// FilesServiceID's bucket are downloaded, chunked (ChunkSizeBytes with
+	// ChunkOverlapBytes overlap), and embedded. FileFormats defaults to
+	// ["txt","md"].
+	FilesServiceID    string   `json:"files_service_id,omitempty"`
+	FilesPrefix       string   `json:"files_prefix,omitempty"`
+	FileFormats       []string `json:"file_formats,omitempty"`
+	ChunkSizeBytes    int      `json:"chunk_size_bytes,omitempty"`
+	ChunkOverlapBytes int      `json:"chunk_overlap_bytes,omitempty"`
+	ModelProvider     string   `json:"model_provider"`
 	EmbeddingModel      string                 `json:"embedding_model"`
 	ModelDimensions     int                    `json:"model_dimensions"`
 	TargetTable         string                 `json:"target_table,omitempty"`

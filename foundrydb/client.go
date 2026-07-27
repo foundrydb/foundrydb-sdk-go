@@ -95,15 +95,25 @@ func New(cfg Config) *Client {
 // do executes an HTTP request against the API. orgID overrides the client-level OrgID when non-empty.
 func (c *Client) do(ctx context.Context, method, path string, body interface{}, orgID string) (*http.Response, error) {
 	var reqBody io.Reader
+	contentType := ""
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("foundrydb: marshal request: %w", err)
 		}
 		reqBody = bytes.NewReader(b)
+		contentType = "application/json"
 	}
+	return c.doRaw(ctx, method, path, reqBody, contentType, orgID)
+}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.cfg.APIURL+path, reqBody)
+// doRaw executes an HTTP request whose body is sent verbatim rather than
+// JSON-encoded, for the endpoints that take an opaque binary payload (a gzipped
+// source tarball). It shares every other concern with do: authentication, the
+// active-org header, and error wrapping. Pass a nil body, and an empty
+// contentType, for a request that has neither.
+func (c *Client) doRaw(ctx context.Context, method, path string, body io.Reader, contentType, orgID string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.cfg.APIURL+path, body)
 	if err != nil {
 		return nil, fmt.Errorf("foundrydb: create request: %w", err)
 	}
@@ -114,8 +124,8 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 		req.SetBasicAuth(c.cfg.Username, c.cfg.Password)
 	}
 
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Accept", "application/json")
 

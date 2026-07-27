@@ -267,6 +267,104 @@ func (c *Client) UpdateInferenceSettings(ctx context.Context, orgID string, req 
 	return &settings, nil
 }
 
+// InferenceChainOverride is one platform AI surface's provider chain
+// override. While it exists, that surface resolves through ProviderChain
+// instead of the org-level chain.
+type InferenceChainOverride struct {
+	OrganizationID string   `json:"organization_id,omitempty"`
+	Surface        string   `json:"surface"`
+	ProviderChain  []string `json:"provider_chain"`
+	CreatedAt      string   `json:"created_at,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+}
+
+// InferenceProviderChainInfo is the organization's provider chain
+// configuration: the ordered chain, whether every provider in it routes
+// EU-resident, and the per-surface overrides currently in place.
+type InferenceProviderChainInfo struct {
+	ProviderChain   []string                 `json:"provider_chain"`
+	FullyEUResident bool                     `json:"fully_eu_resident"`
+	Overrides       []InferenceChainOverride `json:"overrides"`
+}
+
+// SetInferenceProviderChainRequest replaces a provider chain. Each entry is a
+// provider identifier (openai, anthropic, mistral, azure_openai, groq,
+// foundrydb_managed); the literal terminator "none" may close the chain to
+// state that resolution stops there with no implicit platform fallback.
+type SetInferenceProviderChainRequest struct {
+	ProviderChain []string `json:"provider_chain"`
+}
+
+// GetInferenceProviderChain returns the organization's provider chain, its
+// EU-residency verdict, and the per-surface overrides.
+func (c *Client) GetInferenceProviderChain(ctx context.Context, orgID string) (*InferenceProviderChainInfo, error) {
+	resp, err := c.do(ctx, http.MethodGet, orgInferencePath(orgID)+"/chain", nil, orgID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var info InferenceProviderChainInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetInferenceProviderChain response: %w", err)
+	}
+	return &info, nil
+}
+
+// SetInferenceProviderChain replaces the organization's ordered provider
+// chain wholesale. Per-surface overrides are untouched and echoed back in
+// the returned configuration.
+func (c *Client) SetInferenceProviderChain(ctx context.Context, orgID string, chain []string) (*InferenceProviderChainInfo, error) {
+	req := SetInferenceProviderChainRequest{ProviderChain: chain}
+	resp, err := c.do(ctx, http.MethodPut, orgInferencePath(orgID)+"/chain", req, orgID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var info InferenceProviderChainInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode SetInferenceProviderChain response: %w", err)
+	}
+	return &info, nil
+}
+
+// SetInferenceSurfaceOverride replaces the provider chain for one platform AI
+// surface (chat, advisor, embedding, agent, explainer). While the override
+// exists, that surface resolves through it instead of the org-level chain.
+func (c *Client) SetInferenceSurfaceOverride(ctx context.Context, orgID, surface string, chain []string) (*InferenceChainOverride, error) {
+	req := SetInferenceProviderChainRequest{ProviderChain: chain}
+	resp, err := c.do(ctx, http.MethodPut, orgInferencePath(orgID)+"/chain/overrides/"+url.PathEscape(surface), req, orgID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var ov InferenceChainOverride
+	if err := json.Unmarshal(data, &ov); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode SetInferenceSurfaceOverride response: %w", err)
+	}
+	return &ov, nil
+}
+
+// DeleteInferenceSurfaceOverride removes one surface's provider chain
+// override so the org-level chain applies to it again. Deleting an absent
+// override succeeds, so the call is idempotent.
+func (c *Client) DeleteInferenceSurfaceOverride(ctx context.Context, orgID, surface string) error {
+	resp, err := c.do(ctx, http.MethodDelete, orgInferencePath(orgID)+"/chain/overrides/"+url.PathEscape(surface), nil, orgID)
+	if err != nil {
+		return err
+	}
+	_, err = checkResponse(resp)
+	return err
+}
+
 // GetInferenceUsage returns aggregated inference usage for the organization.
 func (c *Client) GetInferenceUsage(ctx context.Context, orgID string, opts InferenceUsageOptions) (*InferenceUsageSummary, error) {
 	q := url.Values{}

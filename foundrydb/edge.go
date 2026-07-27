@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // EdgeDomainStatus tracks a customer custom domain through its lifecycle on
@@ -57,6 +58,21 @@ const (
 	EdgeWAFModeBlock EdgeWAFMode = "block"
 )
 
+// EdgeSteeringMode selects how an app's edge A-record set is published across
+// PoPs. It is a controller-side DNS routing knob and never reaches the edge
+// runtime.
+type EdgeSteeringMode string
+
+const (
+	// EdgeSteeringModeOff publishes only the home PoP's serving IPs, with
+	// automatic whole-PoP failover to another healthy PoP. It is the default.
+	EdgeSteeringModeOff EdgeSteeringMode = "off"
+	// EdgeSteeringModeGeo publishes the union of every healthy PoP's serving IPs,
+	// so the app is served from multiple PoPs at once and a lost PoP drops out of
+	// rotation.
+	EdgeSteeringModeGeo EdgeSteeringMode = "geo"
+)
+
 // EdgeWAFRuleAction selects what a matching custom WAF rule does: block denies a
 // matching request with a 403 (only enforced in block waf_mode; in detect mode
 // it still only logs), log only records a match.
@@ -101,42 +117,15 @@ const (
 type EdgeCacheRule struct {
 	PathPrefix string `json:"path_prefix"`
 	TTLSeconds int    `json:"ttl_seconds"`
-	// StaleWhileRevalidateSeconds, when positive, lets the edge serve a stale
-	// cached response for up to this many seconds past expiry while it
-	// revalidates the entry in the background, so a client never blocks on a
-	// refresh. 0 (the default) disables stale-while-revalidate for the rule.
-	StaleWhileRevalidateSeconds int `json:"stale_while_revalidate_seconds,omitempty"`
-	// StaleIfErrorSeconds, when positive, lets the edge serve a stale cached
-	// response for up to this many seconds past expiry when the origin returns an
-	// error (or is unreachable), so a transient origin failure does not surface to
-	// the client. 0 (the default) disables stale-if-error for the rule.
-	StaleIfErrorSeconds int `json:"stale_if_error_seconds,omitempty"`
-	// CacheKey, when configured, varies the cache key by specific query params,
-	// headers, and/or cookies instead of the default (method + full URI). Nil or
-	// empty preserves the current default behavior.
-	CacheKey *EdgeCacheKey `json:"cache_key,omitempty"`
-	// RequestCollapsing, when true, coalesces concurrent cache-miss fetches for
-	// the same key into a single origin request (the others wait for and share its
-	// response), so a cold key under a burst does not stampede the origin.
-	RequestCollapsing bool `json:"request_collapsing,omitempty"`
-}
-
-// EdgeCacheKey configures how the edge varies the cache key for a cache rule. By
-// default (an empty key) the edge keys cached entries by the request method and
-// the full URI; a configured key narrows or widens that by including only
-// specific query params and/or specific request headers and cookies. A nil or
-// empty key preserves the default behavior exactly.
-type EdgeCacheKey struct {
-	// VaryQueryParams, when non-empty, restricts the query-string contribution to
-	// the cache key to exactly these query parameter names (in the order given).
-	// Empty (the default) keeps the full query string in the key.
-	VaryQueryParams []string `json:"vary_query_params,omitempty"`
-	// VaryHeaders, when non-empty, adds these request header names' values to the
-	// cache key, so a response varies by them. Empty adds no header to the key.
-	VaryHeaders []string `json:"vary_headers,omitempty"`
-	// VaryCookies, when non-empty, adds these cookie names' values to the cache
-	// key, so a response varies by them. Empty adds no cookie to the key.
-	VaryCookies []string `json:"vary_cookies,omitempty"`
+	// MaxObjectSizeBytes, when positive, raises the edge cache's maximum
+	// cacheable response-body size (in bytes) so large files under this prefix
+	// are cached rather than passed through. The edge applies one cap across the
+	// node's cache, so the effective cap is the largest value any rule requests,
+	// floored at the 64 MiB platform default: a rule can only raise the cap (64
+	// MiB to 512 MiB), never lower it below the default. A response larger than
+	// the cap is proxied to the origin and served in full (never truncated). 0
+	// (the default) keeps the platform default cap.
+	MaxObjectSizeBytes int `json:"max_object_size_bytes,omitempty"`
 }
 
 // EdgeRateLimit is a token bucket enforced per PoP at the edge. The
@@ -187,6 +176,27 @@ type EdgeRedirectRule struct {
 	StatusCode int    `json:"status_code,omitempty"`
 }
 
+// EdgeEarlyHint is one preload/preconnect link the edge emits in an HTTP 103
+// Early Hints informational response ahead of the origin's final response. URL
+// is an absolute path or absolute http(s) URL; Rel is "preload" or "preconnect";
+// As is the preload destination (required for preload, omitted for preconnect);
+// CrossOrigin is optionally "anonymous" or "use-credentials".
+type EdgeEarlyHint struct {
+	URL         string `json:"url"`
+	Rel         string `json:"rel"`
+	As          string `json:"as,omitempty"`
+	CrossOrigin string `json:"crossorigin,omitempty"`
+}
+
+// EdgeEarlyHints is the per-app HTTP 103 Early Hints setting. When Enabled with
+// at least one hint, the edge emits a 103 informational response carrying the
+// hints as Link headers before proxying to the origin. A disabled or empty
+// setting emits no 103.
+type EdgeEarlyHints struct {
+	Enabled bool            `json:"enabled,omitempty"`
+	Hints   []EdgeEarlyHint `json:"hints,omitempty"`
+}
+
 // EdgeRuleActionType is the closed enum of actions an edge rule may take. Each
 // value maps to a fixed edge handler (never raw directive text). Terminal
 // actions (redirect, block, origin_override) short-circuit the rule chain (first
@@ -211,6 +221,28 @@ type EdgeRuleHeaderMatch struct {
 	Regex string `json:"regex,omitempty"`
 }
 
+// EdgeRuleCookieMatch matches a single named request cookie. Value, when set,
+// matches the cookie value exactly; an empty Value matches the cookie's mere
+// presence. No regex form is offered: a cookie shares the one Cookie request
+// header with every other cookie, so the edge anchors an exact or presence
+// match on a single cookie with the name and value escaped as literal data.
+type EdgeRuleCookieMatch struct {
+	Name  string `json:"name"`
+	Value string `json:"value,omitempty"`
+}
+
+// EdgeRuleRateCondition is an optional per-rule rate-based gate: the rule's block
+// fires for a matched request only once that client (keyed by connection IP)
+// exceeds RequestsPerWindow matching requests within WindowSeconds. An under-rate
+// matched request falls through to the rest of the chain. The edge renders it by
+// scoping the platform rate limiter to the rule's matcher, so an over-rate
+// request is served an HTTP 429 (Too Many Requests). Only valid with the block
+// action.
+type EdgeRuleRateCondition struct {
+	RequestsPerWindow int `json:"requests_per_window"`
+	WindowSeconds     int `json:"window_seconds"`
+}
+
 // EdgeRuleMatch is the ANDed set of conditions an edge rule matches on. Every set
 // condition must hold; an empty match matches every request.
 type EdgeRuleMatch struct {
@@ -218,6 +250,10 @@ type EdgeRuleMatch struct {
 	PathRegex  string               `json:"path_regex,omitempty"`
 	Methods    []string             `json:"methods,omitempty"`
 	Header     *EdgeRuleHeaderMatch `json:"header,omitempty"`
+	Cookie     *EdgeRuleCookieMatch `json:"cookie,omitempty"`
+	// Rate, when set, gates the rule's block on a per-client request rate. Only
+	// valid with the block action; an over-rate request is served an HTTP 429.
+	Rate *EdgeRuleRateCondition `json:"rate,omitempty"`
 }
 
 // EdgeRuleAction is the closed-enum action a matched edge rule takes. Only the
@@ -246,6 +282,44 @@ type EdgeRule struct {
 	Priority int            `json:"priority,omitempty"`
 	Match    EdgeRuleMatch  `json:"match"`
 	Action   EdgeRuleAction `json:"action"`
+	// WhenFlag, when set, gates the rule on a per-app edge flag (see the Flags map
+	// on the edge settings), resolved at render time: the rule is served only when
+	// the flag store satisfies the gate. Nil means the rule is always served.
+	WhenFlag *EdgeRuleFlagMatch `json:"when_flag,omitempty"`
+	// DryRun marks the rule as staging (log-only): it still matches and is
+	// counted in edge analytics (the edge_rule_dryrun_matches_total series,
+	// labeled by rule), but its action is not enforced, so the request is
+	// unaffected. Use it to evaluate a rule's impact before turning it on.
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// EdgeRuleFlagMatch gates an edge rule on the value of a per-app edge flag,
+// resolved at render time (never a request-time matcher). With an explicit Value
+// the gate holds when the flag equals Value; with an empty Value it holds when
+// the flag is present and truthy (true/1/on/yes, case-insensitive). Negate
+// inverts the result, so a rule can be gated on a flag being off or absent.
+type EdgeRuleFlagMatch struct {
+	Name   string `json:"name"`
+	Value  string `json:"value,omitempty"`
+	Negate bool   `json:"negate,omitempty"`
+}
+
+// EdgeResponseTransformRule is one entry in the ordered origin-response
+// transformation list. It keys on the ORIGIN response status (OnStatus) and
+// either remaps the status while passing the origin body through
+// (Action="set_status", SetStatus the new status), or replaces the response with
+// a branded static body (Action="custom_body", Body plus SetStatus and optional
+// ContentType). It acts on what the origin actually returned, which the
+// request-matched rules-engine set_header action cannot do. Each OnStatus entry
+// is a concrete code (100..599) or a single leading-digit class (1..5 meaning any
+// 1xx..5xx).
+type EdgeResponseTransformRule struct {
+	Name        string `json:"name,omitempty"`
+	OnStatus    []int  `json:"on_status"`
+	Action      string `json:"action"`
+	SetStatus   int    `json:"set_status,omitempty"`
+	Body        string `json:"body,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 // EdgeHeaderRules manipulates HTTP headers at the edge. RequestSet/RequestRemove
@@ -366,11 +440,17 @@ type EdgeOrigin struct {
 // EdgeOriginPool is the per-app set of additional origins beyond the primary
 // auto origin, with the load-balancing policy and failover knobs.
 type EdgeOriginPool struct {
-	AdditionalOrigins  []EdgeOrigin       `json:"additional_origins,omitempty"`
-	LBPolicy           EdgeOriginLBPolicy `json:"lb_policy,omitempty"`
-	TryDurationSeconds int                `json:"try_duration_seconds,omitempty"`
-	Retries            int                `json:"retries,omitempty"`
-	RetryStatuses      []int              `json:"retry_statuses,omitempty"`
+	AdditionalOrigins []EdgeOrigin       `json:"additional_origins,omitempty"`
+	LBPolicy          EdgeOriginLBPolicy `json:"lb_policy,omitempty"`
+	// PrimaryWeight is the share the platform primary origin receives under the
+	// weighted policy, aligned with each additional origin's weight; 0 defaults
+	// to 1 (an equal share). Weight the primary above the additional origins to
+	// run a small percentage canary (primary 9 + one canary origin of weight 1
+	// sends about 10% of traffic to the canary). Ignored by non-weighted policies.
+	PrimaryWeight      int   `json:"primary_weight,omitempty"`
+	TryDurationSeconds int   `json:"try_duration_seconds,omitempty"`
+	Retries            int   `json:"retries,omitempty"`
+	RetryStatuses      []int `json:"retry_statuses,omitempty"`
 }
 
 // EdgeBasicAuthAccountRequest is one inbound Basic Auth account on the settings
@@ -390,225 +470,6 @@ type EdgeBasicAuthRequest struct {
 	Accounts []EdgeBasicAuthAccountRequest `json:"accounts,omitempty"`
 }
 
-// EdgeJWTClaim is one required exact-match claim: when JWT validation is enabled
-// the validated token must carry a claim named Name whose value equals Value.
-type EdgeJWTClaim struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
-// EdgeJWTAuth requires a valid JWT on the matched paths at the edge. When
-// Enabled, the edge verifies the bearer token's signature against EITHER a JWKS
-// URL (fetched signing keys) OR a static set of PublicKeys (exactly one of the
-// two is configured), then enforces the optional Issuer, Audiences, and
-// RequiredClaims. A request without a valid JWT on a matched path is rejected
-// with a 401. When ForwardClaimsHeader is set, the edge forwards the validated
-// claims to the origin under that header. Nil or disabled performs no JWT
-// validation. JWKS URL and static public keys are public by nature, so this
-// carries no secret and is echoed verbatim on the settings response.
-type EdgeJWTAuth struct {
-	Enabled bool `json:"enabled"`
-	// Paths are the absolute path prefixes the JWT validation applies to. Empty
-	// (the default) applies it to all paths.
-	Paths []string `json:"paths,omitempty"`
-	// JWKSURL, when set, is the https URL the edge fetches signing keys from.
-	// Exactly one of JWKSURL / PublicKeys must be set when Enabled.
-	JWKSURL string `json:"jwks_url,omitempty"`
-	// PublicKeys, when set, are static signing keys (PEM-encoded public keys or
-	// JWK JSON). Exactly one of JWKSURL / PublicKeys must be set when Enabled.
-	PublicKeys []string `json:"public_keys,omitempty"`
-	// Issuer, when set, is the expected "iss" claim. Empty enforces no issuer.
-	Issuer string `json:"issuer,omitempty"`
-	// Audiences, when set, are the accepted "aud" values. Empty enforces no audience.
-	Audiences []string `json:"audiences,omitempty"`
-	// RequiredClaims, when set, are exact-match claims the token must carry.
-	RequiredClaims []EdgeJWTClaim `json:"required_claims,omitempty"`
-	// ForwardClaimsHeader, when set, is the request header the edge writes the
-	// validated claims to before forwarding to the origin. Empty forwards nothing.
-	ForwardClaimsHeader string `json:"forward_claims_header,omitempty"`
-}
-
-// EdgeSignedURLs requires a valid HMAC signature and unexpired link on the
-// matched paths at the edge. The signing secret VALUE is never carried in this
-// document: only SecretName (a reference to a separately configured secret) is
-// present, so the same shape serves the request and the settings response. Nil
-// or disabled performs no signature checking.
-type EdgeSignedURLs struct {
-	Enabled bool `json:"enabled"`
-	// Paths are the absolute path prefixes requiring a valid signature. Empty (the
-	// default) applies signature checking to all paths.
-	Paths []string `json:"paths,omitempty"`
-	// SecretName references the configured signing secret. The secret VALUE is
-	// resolved separately and never stored here. Required when Enabled.
-	SecretName string `json:"secret_name,omitempty"`
-	// TTLSeconds caps the maximum link age. 0 means no cap (the link's own exp
-	// governs).
-	TTLSeconds int `json:"ttl_seconds,omitempty"`
-	// SignatureParam is the query parameter carrying the HMAC signature. Empty
-	// defaults to "sig".
-	SignatureParam string `json:"signature_param,omitempty"`
-	// ExpiresParam is the query parameter carrying the link expiry (a unix
-	// timestamp). Empty defaults to "exp".
-	ExpiresParam string `json:"expires_param,omitempty"`
-}
-
-// EdgeAPIKeyLocation selects where the edge reads the API key from.
-type EdgeAPIKeyLocation string
-
-const (
-	// EdgeAPIKeyLocationHeader reads the key from a request header named KeyName.
-	EdgeAPIKeyLocationHeader EdgeAPIKeyLocation = "header"
-	// EdgeAPIKeyLocationQuery reads the key from a query parameter named KeyName.
-	EdgeAPIKeyLocationQuery EdgeAPIKeyLocation = "query"
-)
-
-// EdgeAPIKeyRequest is one inbound API key on the settings request. Key is the
-// PLAINTEXT key the controller hashes and discards (it is write-only and never
-// echoed). An empty Key for an existing key Name keeps that key's stored hash on
-// update. RateTier is the optional per-key rate limit.
-type EdgeAPIKeyRequest struct {
-	Name string `json:"name"`
-	// Key is the transient plaintext API key. The controller hashes it and never
-	// stores or logs it. An empty Key for an existing Name keeps that key's stored
-	// hash.
-	Key string `json:"key,omitempty"`
-	// RateTier is the optional per-key rate limit applied to requests
-	// authenticated with this key.
-	RateTier *EdgeRateLimit `json:"rate_tier,omitempty"`
-}
-
-// EdgeAPIKeyAuthRequest is the inbound API key setting on the settings request.
-// It carries plaintext keys that the controller hashes and discards; the stored
-// document only ever carries the resulting key hashes (never echoed back).
-type EdgeAPIKeyAuthRequest struct {
-	Enabled     bool                `json:"enabled"`
-	Paths       []string            `json:"paths,omitempty"`
-	KeyLocation EdgeAPIKeyLocation  `json:"key_location,omitempty"`
-	KeyName     string              `json:"key_name,omitempty"`
-	Keys        []EdgeAPIKeyRequest `json:"keys,omitempty"`
-}
-
-// EdgeAPIKeyView is the non-secret projection of one API key returned on the
-// settings response: the opaque Name and the optional per-key rate tier, never
-// the key hash or plaintext.
-type EdgeAPIKeyView struct {
-	Name     string         `json:"name"`
-	RateTier *EdgeRateLimit `json:"rate_tier,omitempty"`
-}
-
-// EdgeAPIKeyAuthView is the non-secret projection of the API key setting on the
-// settings response. It echoes the enabled flag, paths, location, key name, and
-// the per-key NAMES (with any rate tier), never any key hash or plaintext key.
-type EdgeAPIKeyAuthView struct {
-	Enabled     bool               `json:"enabled"`
-	Paths       []string           `json:"paths,omitempty"`
-	KeyLocation EdgeAPIKeyLocation `json:"key_location,omitempty"`
-	KeyName     string             `json:"key_name,omitempty"`
-	Keys        []EdgeAPIKeyView   `json:"keys,omitempty"`
-}
-
-// EdgeWAFExclusion removes a CRS rule (by RuleID) or a single target (for
-// example "ARGS:username") from inspection for one app, to suppress a known
-// false positive. At least one of RuleID / Target is set.
-type EdgeWAFExclusion struct {
-	// RuleID, when set, is the CRS rule id the exclusion applies to. 0 means "not
-	// set" (Target alone then applies the exclusion to all rules).
-	RuleID int `json:"rule_id,omitempty"`
-	// Target, when set, is the inspection target to exclude (for example
-	// "ARGS:username"). A bounded render-safe token.
-	Target string `json:"target,omitempty"`
-}
-
-// EdgeDDoSProfile is the per-app platform L4/L7 DDoS abuse profile. When
-// Enabled, the firewall and edge cap a single source's request rate, burst, and
-// concurrent connections. It is platform protection layered under the customer's
-// own EdgeRateLimit; the two are independent. Nil or disabled leaves only the
-// platform baseline.
-type EdgeDDoSProfile struct {
-	Enabled bool `json:"enabled"`
-	// PerIPRequestsPerSecond is the per-source request-rate cap. 0 applies the
-	// platform default.
-	PerIPRequestsPerSecond int `json:"per_ip_requests_per_second,omitempty"`
-	// PerIPBurst is the per-source burst allowance. 0 applies the platform default.
-	PerIPBurst int `json:"per_ip_burst,omitempty"`
-	// PerIPConnCap is the per-source concurrent L4 connection ceiling enforced at
-	// the firewall. 0 applies the platform default.
-	PerIPConnCap int `json:"per_ip_conn_cap,omitempty"`
-}
-
-// EdgeBotAction selects what bot management does with a request classified as a
-// bot.
-type EdgeBotAction string
-
-const (
-	// EdgeBotActionLog only logs a bot classification (never blocks).
-	EdgeBotActionLog EdgeBotAction = "log"
-	// EdgeBotActionBlock denies a request classified as a bad bot with a 403.
-	EdgeBotActionBlock EdgeBotAction = "block"
-	// EdgeBotActionChallenge is reserved for a future interactive challenge; until
-	// then the edge treats it as log.
-	EdgeBotActionChallenge EdgeBotAction = "challenge"
-)
-
-// EdgeBotManagement is the per-app bot management policy at the edge. When
-// Enabled, the edge classifies requests as bots (by known-bad-bot signatures
-// and/or a rate-based heuristic) and applies Action to a matched request. Nil or
-// disabled performs no bot classification.
-type EdgeBotManagement struct {
-	Enabled bool `json:"enabled"`
-	// Action is what to do with a request classified as a bad bot: log (default)
-	// or block. "challenge" is accepted as a reserved value but is deferred.
-	Action EdgeBotAction `json:"action,omitempty"`
-	// KnownBadBots enables matching against the platform's known-bad-bot signature set.
-	KnownBadBots bool `json:"known_bad_bots,omitempty"`
-	// RateBasedHeuristic enables a rate-based bot heuristic.
-	RateBasedHeuristic bool `json:"rate_based_heuristic,omitempty"`
-}
-
-// EdgeATOAction selects what account-takeover protection does when a detection
-// threshold is crossed.
-type EdgeATOAction string
-
-const (
-	// EdgeATOActionAlert raises an alert only (never throttles or locks). The safe
-	// default.
-	EdgeATOActionAlert EdgeATOAction = "alert"
-	// EdgeATOActionRateLimit throttles the offending source/username when the
-	// threshold is crossed.
-	EdgeATOActionRateLimit EdgeATOAction = "ratelimit"
-	// EdgeATOActionLock temporarily locks the offending source/username when the
-	// threshold is crossed.
-	EdgeATOActionLock EdgeATOAction = "lock"
-)
-
-// EdgeATOProtection is the per-app account-takeover protection setting. When
-// Enabled, the controller's ATO worker watches authentication attempts to
-// AuthPaths (failures counted by FailureStatusCodes) and, when a per-IP or
-// per-username failure rate crosses its threshold, applies Action. Nil or
-// disabled performs no ATO detection. The per-username dimension is active only
-// when both PerUsernameThresholdPerMin is positive and UsernameField is set.
-type EdgeATOProtection struct {
-	Enabled bool `json:"enabled"`
-	// AuthPaths are the absolute request paths the worker watches for auth
-	// attempts. Empty performs no detection.
-	AuthPaths []string `json:"auth_paths,omitempty"`
-	// FailureStatusCodes are the HTTP status codes counted as an authentication
-	// failure. Empty defaults to [401, 403].
-	FailureStatusCodes []int `json:"failure_status_codes,omitempty"`
-	// PerIPThresholdPerMin is the per-IP auth-failure rate (per minute) that
-	// crosses into Action. 0 disables the per-IP dimension.
-	PerIPThresholdPerMin int `json:"per_ip_threshold_per_min,omitempty"`
-	// PerUsernameThresholdPerMin is the per-username auth-failure rate (per minute)
-	// that crosses into Action. 0 disables the per-username dimension.
-	PerUsernameThresholdPerMin int `json:"per_username_threshold_per_min,omitempty"`
-	// UsernameField, when set, is the form or JSON field name the worker reads the
-	// attempted username from for per-username detection.
-	UsernameField string `json:"username_field,omitempty"`
-	// Action is what to do when a threshold is crossed: alert (default),
-	// ratelimit, or lock.
-	Action EdgeATOAction `json:"action,omitempty"`
-}
-
 // EdgeSettingsRequest is the customer-tunable subset of the edge config, written
 // via PUT /app-services/{id}/edge/settings. Domains and origin are
 // platform-derived and not settable here. Each list/pointer field replaces the
@@ -617,6 +478,7 @@ type EdgeSettingsRequest struct {
 	CacheRules          []EdgeCacheRule        `json:"cache_rules,omitempty"`
 	RateLimit           *EdgeRateLimit         `json:"rate_limit,omitempty"`
 	WAFMode             *EdgeWAFMode           `json:"waf_mode,omitempty"`
+	SteeringMode        *EdgeSteeringMode      `json:"steering_mode,omitempty"`
 	CustomWAFRules      []EdgeWAFRule          `json:"custom_waf_rules,omitempty"`
 	IPAllowList         []string               `json:"ip_allow_list,omitempty"`
 	IPDenyList          []string               `json:"ip_deny_list,omitempty"`
@@ -643,29 +505,19 @@ type EdgeSettingsRequest struct {
 	// Rules is the additive, ordered, composable rules engine list. It replaces
 	// the stored list wholesale; an empty list (or omitted) clears all rules.
 	Rules []EdgeRule `json:"rules,omitempty"`
-	// JWTAuth is the per-app edge JWT validation setting; nil clears it.
-	JWTAuth *EdgeJWTAuth `json:"jwt_auth,omitempty"`
-	// SignedURLs is the per-app edge signed-URL setting (secret referenced by
-	// name); nil clears it.
-	SignedURLs *EdgeSignedURLs `json:"signed_urls,omitempty"`
-	// APIKeyAuth is the per-app edge API key setting. It carries plaintext keys
-	// the controller hashes and discards; nil clears it.
-	APIKeyAuth *EdgeAPIKeyAuthRequest `json:"api_key_auth,omitempty"`
-	// WAFParanoiaLevel is the per-app OWASP CRS paranoia level (1..4); 0 means the
-	// platform default (PL1) applies.
-	WAFParanoiaLevel int `json:"waf_paranoia_level,omitempty"`
-	// WAFRuleExclusions is the per-app CRS rule/target exclusion list; empty means
-	// no exclusions.
-	WAFRuleExclusions []EdgeWAFExclusion `json:"waf_rule_exclusions,omitempty"`
-	// DDoSProfile is the per-app platform DDoS abuse profile; nil means only the
-	// platform baseline applies.
-	DDoSProfile *EdgeDDoSProfile `json:"ddos_profile,omitempty"`
-	// BotManagement is the per-app bot management setting; nil means no bot
-	// classification.
-	BotManagement *EdgeBotManagement `json:"bot_management,omitempty"`
-	// ATOProtection is the per-app account-takeover protection setting; nil means
-	// no ATO detection.
-	ATOProtection *EdgeATOProtection `json:"ato_protection,omitempty"`
+	// ResponseTransforms is the ordered origin-response transformation list (remap
+	// status or serve a branded body based on the origin response status). It
+	// replaces the stored list wholesale; an empty list (or omitted) clears all
+	// response transforms.
+	ResponseTransforms []EdgeResponseTransformRule `json:"response_transforms,omitempty"`
+	// Flags is the per-app edge flag / config store: a small map of string keys to
+	// string values (a boolean flag is "true"/"false") the edge evaluates locally
+	// at render time. A rule reads a flag through its WhenFlag gate. It replaces the
+	// stored map wholesale; an empty map (or omitted) clears all flags.
+	Flags map[string]string `json:"flags,omitempty"`
+	// EarlyHints is the HTTP 103 Early Hints setting. It replaces the stored value
+	// wholesale; a nil, disabled, or empty-hint value clears the 103.
+	EarlyHints *EdgeEarlyHints `json:"early_hints,omitempty"`
 }
 
 // EdgeApplicationStatusItem is one PoP's convergence state.
@@ -694,6 +546,7 @@ type EdgeSettings struct {
 	CacheRules          []EdgeCacheRule        `json:"cache_rules,omitempty"`
 	RateLimit           *EdgeRateLimit         `json:"rate_limit,omitempty"`
 	WAFMode             EdgeWAFMode            `json:"waf_mode"`
+	SteeringMode        EdgeSteeringMode       `json:"steering_mode,omitempty"`
 	CustomWAFRules      []EdgeWAFRule          `json:"custom_waf_rules,omitempty"`
 	IPAllowList         []string               `json:"ip_allow_list,omitempty"`
 	IPDenyList          []string               `json:"ip_deny_list,omitempty"`
@@ -718,31 +571,16 @@ type EdgeSettings struct {
 	// Rules is the additive, ordered, composable rules engine list; empty means no
 	// rules.
 	Rules []EdgeRule `json:"rules,omitempty"`
-	// JWTAuth is the per-app edge JWT validation setting echoed back; it carries
-	// no secret (only the JWKS URL or static public keys, which are public).
-	JWTAuth *EdgeJWTAuth `json:"jwt_auth,omitempty"`
-	// SignedURLs is the per-app edge signed-URL setting echoed back; the signing
-	// secret is referenced by name only and never echoed.
-	SignedURLs *EdgeSignedURLs `json:"signed_urls,omitempty"`
-	// APIKeyAuth is the non-secret projection of the per-app API key setting: key
-	// names and per-key rate tiers only, never any key hash or plaintext.
-	APIKeyAuth *EdgeAPIKeyAuthView `json:"api_key_auth,omitempty"`
-	// WAFParanoiaLevel is the per-app OWASP CRS paranoia level (1..4); 0 means the
-	// platform default (PL1) applies.
-	WAFParanoiaLevel int `json:"waf_paranoia_level,omitempty"`
-	// WAFRuleExclusions is the per-app CRS rule/target exclusion list; empty means
-	// no exclusions.
-	WAFRuleExclusions []EdgeWAFExclusion `json:"waf_rule_exclusions,omitempty"`
-	// DDoSProfile is the per-app platform DDoS abuse profile; nil means only the
-	// platform baseline applies.
-	DDoSProfile *EdgeDDoSProfile `json:"ddos_profile,omitempty"`
-	// BotManagement is the per-app bot management setting; nil means no bot
-	// classification.
-	BotManagement *EdgeBotManagement `json:"bot_management,omitempty"`
-	// ATOProtection is the per-app account-takeover protection setting; nil means
-	// no ATO detection.
-	ATOProtection *EdgeATOProtection `json:"ato_protection,omitempty"`
-	ConfigVersion int64              `json:"config_version"`
+	// ResponseTransforms is the ordered origin-response transformation list; empty
+	// means no response transforms.
+	ResponseTransforms []EdgeResponseTransformRule `json:"response_transforms,omitempty"`
+	// Flags is the per-app edge flag / config store (string keys to string values)
+	// the edge resolves locally at render time; empty means no flags.
+	Flags map[string]string `json:"flags,omitempty"`
+	// EarlyHints is the HTTP 103 Early Hints setting; nil or disabled means the
+	// edge emits no 103.
+	EarlyHints    *EdgeEarlyHints `json:"early_hints,omitempty"`
+	ConfigVersion int64           `json:"config_version"`
 }
 
 // listEdgeDomainsResponse wraps the list-domains response envelope.
@@ -810,6 +648,78 @@ func (c *Client) DeleteAppDomain(ctx context.Context, appServiceID, domainID str
 	}
 	_, err = checkResponse(resp)
 	return err
+}
+
+// UploadDomainCertificateRequest carries a customer-supplied TLS certificate
+// for one custom domain via PUT /app-services/{id}/domains/{domainId}/certificate.
+// CertificatePEM is the leaf certificate followed by any intermediates;
+// PrivateKeyPEM is the matching private key. The private key is write-only and
+// is never returned in any response.
+type UploadDomainCertificateRequest struct {
+	CertificatePEM string `json:"certificate_pem"`
+	PrivateKeyPEM  string `json:"private_key_pem"`
+}
+
+// DomainCertificateSource records who supplied a stored custom-domain
+// certificate: "acme" for an auto-issued certificate the edge harvested,
+// "customer" for a bring-your-own upload.
+type DomainCertificateSource string
+
+const (
+	DomainCertificateSourceACME     DomainCertificateSource = "acme"
+	DomainCertificateSourceCustomer DomainCertificateSource = "customer"
+)
+
+// DomainCertificateResponse is the non-secret summary of the certificate stored
+// for a custom domain. The certificate and private-key material are never
+// included.
+type DomainCertificateResponse struct {
+	Domain          string                  `json:"domain"`
+	Source          DomainCertificateSource `json:"source"`
+	NotAfter        time.Time               `json:"not_after"`
+	IssuerCN        string                  `json:"issuer_cn,omitempty"`
+	CertFingerprint string                  `json:"cert_fingerprint"`
+	UpdatedAt       time.Time               `json:"updated_at"`
+}
+
+// UploadAppDomainCertificate uploads a customer-supplied TLS certificate for one
+// of the app's verified custom domains, instead of relying on automatic
+// certificate issuance at the edge. The certificate is validated against the
+// domain and, once stored, is served fleet-wide and never auto-renewed by the
+// platform (the customer owns its lifecycle). The private key is write-only.
+func (c *Client) UploadAppDomainCertificate(ctx context.Context, appServiceID, domainID string, req UploadDomainCertificateRequest) (*DomainCertificateResponse, error) {
+	resp, err := c.do(ctx, http.MethodPut, "/app-services/"+appServiceID+"/domains/"+domainID+"/certificate", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out DomainCertificateResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode UploadAppDomainCertificate response: %w", err)
+	}
+	return &out, nil
+}
+
+// GetAppDomainCertificate returns the non-secret summary of the certificate
+// currently stored for a custom domain (source, expiry, issuer, fingerprint).
+// The certificate and private-key material are never returned.
+func (c *Client) GetAppDomainCertificate(ctx context.Context, appServiceID, domainID string) (*DomainCertificateResponse, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/domains/"+domainID+"/certificate", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out DomainCertificateResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetAppDomainCertificate response: %w", err)
+	}
+	return &out, nil
 }
 
 // GetAppEdgeStatus returns the edge overview for an app service: whether the
@@ -1168,181 +1078,6 @@ func (c *Client) TestEdgeLogDrain(ctx context.Context, appServiceID, drainID str
 	return &result, nil
 }
 
-// EdgeConfigVersion is one entry in the append-only edge config version history.
-// The live edge configuration is the single source of truth for what is active;
-// this history is the immutable audit trail and the source a rollback restores
-// from.
-type EdgeConfigVersion struct {
-	Version    int64  `json:"version"`
-	ConfigHash string `json:"config_hash"`
-	// Source is what produced this version: "reconcile" (a platform recompute
-	// bump), "settings" (a customer settings write), or "rollback" (a restore of
-	// a prior version's customer-settable subset).
-	Source string `json:"source"`
-	// CreatedBy is the user that initiated the change, when attributable
-	// (settings or rollback). Nil for reconciler bumps.
-	CreatedBy *string `json:"created_by,omitempty"`
-	CreatedAt string  `json:"created_at"`
-	// Active reports whether this version is the currently active (live) version.
-	Active bool `json:"active"`
-	// RolledBackFrom, for a rollback version, is the version whose
-	// customer-settable subset it restored. Nil for any other source.
-	RolledBackFrom *int64 `json:"rolled_back_from,omitempty"`
-}
-
-// EdgeConfigVersions is the GET /app-services/{id}/edge/versions response: the
-// app's edge config version history (newest first, bounded) and the live active
-// version.
-type EdgeConfigVersions struct {
-	ActiveVersion int64               `json:"active_version"`
-	Versions      []EdgeConfigVersion `json:"versions"`
-}
-
-// EdgeRollbackRequest names the version to roll back to. Supply exactly one of
-// ToVersion (an explicit positive version) or To set to "previous" (the version
-// immediately before the active one).
-type EdgeRollbackRequest struct {
-	ToVersion int64  `json:"to_version,omitempty"`
-	To        string `json:"to,omitempty"`
-}
-
-// EdgeRollbackResponse reports the new active version a rollback produced. The
-// rollback writes a NEW forward version restoring the target's customer-settable
-// subset; it never mutates the history.
-type EdgeRollbackResponse struct {
-	ActiveVersion  int64  `json:"active_version"`
-	RolledBackFrom int64  `json:"rolled_back_from"`
-	Source         string `json:"source"`
-}
-
-// ListAppEdgeConfigVersions returns the append-only version history of an app
-// service's edge configuration, newest first, plus the live active version. Use
-// it to find a version to roll back to with RollbackAppEdgeConfig.
-func (c *Client) ListAppEdgeConfigVersions(ctx context.Context, appServiceID string) (*EdgeConfigVersions, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/edge/versions", nil, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var out EdgeConfigVersions
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode ListAppEdgeConfigVersions response: %w", err)
-	}
-	return &out, nil
-}
-
-// RollbackAppEdgeConfig rolls an app service's edge configuration back to a prior
-// version. Supply exactly one of req.ToVersion or req.To="previous". The rollback
-// restores the target version's customer-settable subset onto the live
-// configuration as a NEW forward version (keeping the current platform-derived
-// domains and origin); it never mutates the history. The edge fleet converges on
-// the new version asynchronously (poll GetAppEdgeStatus). The response returns
-// the new active version.
-func (c *Client) RollbackAppEdgeConfig(ctx context.Context, appServiceID string, req EdgeRollbackRequest) (*EdgeRollbackResponse, error) {
-	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollback", req, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var out EdgeRollbackResponse
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode RollbackAppEdgeConfig response: %w", err)
-	}
-	return &out, nil
-}
-
-// EdgeRollout is one staged edge config rollout. A rollout stages a new config
-// version to a canary subset (one node, or one PoP) first, then either promotes
-// it to the rest of the fleet or aborts (the rest is never given the version).
-type EdgeRollout struct {
-	ID            string `json:"id"`
-	TargetVersion int64  `json:"target_version"`
-	// Phase is one of "canary" (held on the subset), "promoting" (fanning out to
-	// the whole fleet), "promoted" (whole fleet converged), or "aborted" (the rest
-	// of the fleet was never given the version).
-	Phase string `json:"phase"`
-	// CanaryScope is "node" (CanarySelector is a VM UUID) or "pop" (CanarySelector
-	// is a zone code).
-	CanaryScope    string  `json:"canary_scope"`
-	CanarySelector string  `json:"canary_selector,omitempty"`
-	StartedAt      string  `json:"started_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	PromotedAt     *string `json:"promoted_at,omitempty"`
-	AbortedAt      *string `json:"aborted_at,omitempty"`
-	AbortReason    *string `json:"abort_reason,omitempty"`
-}
-
-// EdgeRolloutStatus is the GET /app-services/{id}/edge/rollout response: the
-// app's current (or most recent) rollout. Active reports whether the rollout is
-// in a non-terminal phase (canary or promoting); Rollout is nil when the app has
-// never had a rollout.
-type EdgeRolloutStatus struct {
-	Active  bool         `json:"active"`
-	Rollout *EdgeRollout `json:"rollout,omitempty"`
-}
-
-// EdgeRolloutAbortRequest carries an optional operator note recorded as the
-// rollout's abort reason. An empty Reason records a default "manual abort" note.
-type EdgeRolloutAbortRequest struct {
-	Reason string `json:"reason,omitempty"`
-}
-
-// GetAppEdgeRollout returns the app service's current staged config rollout (the
-// active one, or the most recent terminal one), or Active=false with a nil
-// rollout when the app has never had one. Canary rollouts are opened by the
-// platform when the app's edge settings enable CanaryRolloutEnabled and a new
-// config version is produced.
-func (c *Client) GetAppEdgeRollout(ctx context.Context, appServiceID string) (*EdgeRolloutStatus, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/edge/rollout", nil, "")
-	if err != nil {
-		return nil, err
-	}
-	data, err := checkResponse(resp)
-	if err != nil {
-		return nil, err
-	}
-	var out EdgeRolloutStatus
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("foundrydb: decode GetAppEdgeRollout response: %w", err)
-	}
-	return &out, nil
-}
-
-// PromoteAppEdgeRollout promotes a holding canary rollout so the platform fans
-// the canary version out to the rest of the fleet. Only an active rollout in the
-// canary phase can be promoted.
-func (c *Client) PromoteAppEdgeRollout(ctx context.Context, appServiceID string) error {
-	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollout/promote", nil, "")
-	if err != nil {
-		return err
-	}
-	if _, err := checkResponse(resp); err != nil {
-		return err
-	}
-	return nil
-}
-
-// AbortAppEdgeRollout aborts an active rollout. The rest of the fleet was never
-// given the target version, so it keeps serving the prior version; the canary
-// subset can be recovered with RollbackAppEdgeConfig. Reason is an optional
-// operator note.
-func (c *Client) AbortAppEdgeRollout(ctx context.Context, appServiceID string, req EdgeRolloutAbortRequest) error {
-	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollout/abort", req, "")
-	if err != nil {
-		return err
-	}
-	if _, err := checkResponse(resp); err != nil {
-		return err
-	}
-	return nil
-}
-
 // -----------------------------------------------------------------------------
 // Edge fleet administration (admin only)
 //
@@ -1687,4 +1422,179 @@ func (c *Client) GetEdgeRoutes(ctx context.Context, windowMinutes int) (*EdgeRou
 		return nil, fmt.Errorf("foundrydb: decode GetEdgeRoutes response: %w", err)
 	}
 	return &out, nil
+}
+
+// EdgeConfigVersion is one entry in the append-only edge config version history.
+// The live edge configuration is the single source of truth for what is active;
+// this history is the immutable audit trail and the source a rollback restores
+// from.
+type EdgeConfigVersion struct {
+	Version    int64  `json:"version"`
+	ConfigHash string `json:"config_hash"`
+	// Source is what produced this version: "reconcile" (a platform recompute
+	// bump), "settings" (a customer settings write), or "rollback" (a restore of
+	// a prior version's customer-settable subset).
+	Source string `json:"source"`
+	// CreatedBy is the user that initiated the change, when attributable
+	// (settings or rollback). Nil for reconciler bumps.
+	CreatedBy *string `json:"created_by,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	// Active reports whether this version is the currently active (live) version.
+	Active bool `json:"active"`
+	// RolledBackFrom, for a rollback version, is the version whose
+	// customer-settable subset it restored. Nil for any other source.
+	RolledBackFrom *int64 `json:"rolled_back_from,omitempty"`
+}
+
+// EdgeConfigVersions is the GET /app-services/{id}/edge/versions response: the
+// app's edge config version history (newest first, bounded) and the live active
+// version.
+type EdgeConfigVersions struct {
+	ActiveVersion int64               `json:"active_version"`
+	Versions      []EdgeConfigVersion `json:"versions"`
+}
+
+// EdgeRollbackRequest names the version to roll back to. Supply exactly one of
+// ToVersion (an explicit positive version) or To set to "previous" (the version
+// immediately before the active one).
+type EdgeRollbackRequest struct {
+	ToVersion int64  `json:"to_version,omitempty"`
+	To        string `json:"to,omitempty"`
+}
+
+// EdgeRollbackResponse reports the new active version a rollback produced. The
+// rollback writes a NEW forward version restoring the target's customer-settable
+// subset; it never mutates the history.
+type EdgeRollbackResponse struct {
+	ActiveVersion  int64  `json:"active_version"`
+	RolledBackFrom int64  `json:"rolled_back_from"`
+	Source         string `json:"source"`
+}
+
+// ListAppEdgeConfigVersions returns the append-only version history of an app
+// service's edge configuration, newest first, plus the live active version. Use
+// it to find a version to roll back to with RollbackAppEdgeConfig.
+func (c *Client) ListAppEdgeConfigVersions(ctx context.Context, appServiceID string) (*EdgeConfigVersions, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/edge/versions", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeConfigVersions
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode ListAppEdgeConfigVersions response: %w", err)
+	}
+	return &out, nil
+}
+
+// RollbackAppEdgeConfig rolls an app service's edge configuration back to a prior
+// version. Supply exactly one of req.ToVersion or req.To="previous". The rollback
+// restores the target version's customer-settable subset onto the live
+// configuration as a NEW forward version (keeping the current platform-derived
+// domains and origin); it never mutates the history. The edge fleet converges on
+// the new version asynchronously (poll GetAppEdgeStatus). The response returns
+// the new active version.
+func (c *Client) RollbackAppEdgeConfig(ctx context.Context, appServiceID string, req EdgeRollbackRequest) (*EdgeRollbackResponse, error) {
+	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollback", req, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeRollbackResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode RollbackAppEdgeConfig response: %w", err)
+	}
+	return &out, nil
+}
+
+// EdgeRollout is one staged edge config rollout. A rollout stages a new config
+// version to a canary subset (one node, or one PoP) first, then either promotes
+// it to the rest of the fleet or aborts (the rest is never given the version).
+type EdgeRollout struct {
+	ID            string `json:"id"`
+	TargetVersion int64  `json:"target_version"`
+	// Phase is one of "canary" (held on the subset), "promoting" (fanning out to
+	// the whole fleet), "promoted" (whole fleet converged), or "aborted" (the rest
+	// of the fleet was never given the version).
+	Phase string `json:"phase"`
+	// CanaryScope is "node" (CanarySelector is a VM UUID) or "pop" (CanarySelector
+	// is a zone code).
+	CanaryScope    string  `json:"canary_scope"`
+	CanarySelector string  `json:"canary_selector,omitempty"`
+	StartedAt      string  `json:"started_at"`
+	UpdatedAt      string  `json:"updated_at"`
+	PromotedAt     *string `json:"promoted_at,omitempty"`
+	AbortedAt      *string `json:"aborted_at,omitempty"`
+	AbortReason    *string `json:"abort_reason,omitempty"`
+}
+
+// EdgeRolloutStatus is the GET /app-services/{id}/edge/rollout response: the
+// app's current (or most recent) rollout. Active reports whether the rollout is
+// in a non-terminal phase (canary or promoting); Rollout is nil when the app has
+// never had a rollout.
+type EdgeRolloutStatus struct {
+	Active  bool         `json:"active"`
+	Rollout *EdgeRollout `json:"rollout,omitempty"`
+}
+
+// EdgeRolloutAbortRequest carries an optional operator note recorded as the
+// rollout's abort reason. An empty Reason records a default "manual abort" note.
+type EdgeRolloutAbortRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// GetAppEdgeRollout returns the app service's current staged config rollout (the
+// active one, or the most recent terminal one), or Active=false with a nil
+// rollout when the app has never had one. Canary rollouts are opened by the
+// platform when the app's edge settings enable CanaryRolloutEnabled and a new
+// config version is produced.
+func (c *Client) GetAppEdgeRollout(ctx context.Context, appServiceID string) (*EdgeRolloutStatus, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/app-services/"+appServiceID+"/edge/rollout", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	data, err := checkResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	var out EdgeRolloutStatus
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("foundrydb: decode GetAppEdgeRollout response: %w", err)
+	}
+	return &out, nil
+}
+
+// PromoteAppEdgeRollout promotes a holding canary rollout so the platform fans
+// the canary version out to the rest of the fleet. Only an active rollout in the
+// canary phase can be promoted.
+func (c *Client) PromoteAppEdgeRollout(ctx context.Context, appServiceID string) error {
+	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollout/promote", nil, "")
+	if err != nil {
+		return err
+	}
+	if _, err := checkResponse(resp); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AbortAppEdgeRollout aborts an active rollout. The rest of the fleet was never
+// given the target version, so it keeps serving the prior version; the canary
+// subset can be recovered with RollbackAppEdgeConfig. Reason is an optional
+// operator note.
+func (c *Client) AbortAppEdgeRollout(ctx context.Context, appServiceID string, req EdgeRolloutAbortRequest) error {
+	resp, err := c.do(ctx, http.MethodPost, "/app-services/"+appServiceID+"/edge/rollout/abort", req, "")
+	if err != nil {
+		return err
+	}
+	if _, err := checkResponse(resp); err != nil {
+		return err
+	}
+	return nil
 }
