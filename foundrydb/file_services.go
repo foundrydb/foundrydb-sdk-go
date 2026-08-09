@@ -241,8 +241,11 @@ type FilesObject struct {
 // FilesObjectPage is one page of a bucket listing. A non-empty NextCursor
 // means more objects follow; pass it as the cursor of the next call.
 type FilesObjectPage struct {
-	Objects    []FilesObject `json:"objects"`
-	NextCursor string        `json:"next_cursor,omitempty"`
+	Objects []FilesObject `json:"objects"`
+	// Prefixes are common prefixes ("folders") under the current prefix,
+	// present when the request used a delimiter. Each ends with the delimiter.
+	Prefixes   []string `json:"prefixes,omitempty"`
+	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
 type listFilesServicesResponse struct {
@@ -440,13 +443,16 @@ func (c *Client) PresignFilesURL(ctx context.Context, serviceID string, req Pres
 // filtered by key prefix. max bounds the page size (0 applies the platform
 // default of 100, the maximum is 1000); pass the previous page's NextCursor as
 // cursor to continue the listing.
-func (c *Client) ListFilesObjects(ctx context.Context, serviceID, prefix, cursor string, max int) (*FilesObjectPage, error) {
+func (c *Client) ListFilesObjects(ctx context.Context, serviceID, prefix, cursor, delimiter string, max int) (*FilesObjectPage, error) {
 	q := url.Values{}
 	if prefix != "" {
 		q.Set("prefix", prefix)
 	}
 	if cursor != "" {
 		q.Set("cursor", cursor)
+	}
+	if delimiter != "" {
+		q.Set("delimiter", delimiter)
 	}
 	if max > 0 {
 		q.Set("max", strconv.Itoa(max))
