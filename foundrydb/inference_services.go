@@ -539,6 +539,11 @@ type InferenceFitSuggestion struct {
 	// MaxModelLen is the context length that would fit. Set on "reduce_context"
 	// only.
 	MaxModelLen int `json:"max_model_len,omitempty"`
+	// TensorParallelSize is the number of ranks the model must be sharded across
+	// for the remedy to fit. Set only when the fix needs a different shard count
+	// from the one asked for, which is how a multi-card plan is offered for a
+	// model that does not fit on one card.
+	TensorParallelSize int `json:"tensor_parallel_size,omitempty"`
 }
 
 // InferenceFitCheckResult is the verdict of the VRAM fit preflight, the memory
@@ -567,6 +572,18 @@ type InferenceFitCheckResult struct {
 	// Suggestions are the closest fixes, most relevant first. Empty when the
 	// configuration already fits.
 	Suggestions []InferenceFitSuggestion `json:"suggestions"`
+	// RecommendedPlan is the smallest GPU plan this request fits on, found
+	// through the same per-card equation as the verdict. It is answered whether
+	// or not the plan that was asked about fits, so a create flow can offer the
+	// fitting plan as its default rather than asking a customer to size a GPU
+	// themselves. Empty only when no plan in the registry fits the request at
+	// all.
+	RecommendedPlan string `json:"recommended_plan,omitempty"`
+	// RecommendedTensorParallelSize is the shard count RecommendedPlan needs: 1
+	// when a single card of that plan holds the model, higher when the plan
+	// reaches the fit only by sharding across the cards it has. Zero alongside an
+	// empty RecommendedPlan.
+	RecommendedTensorParallelSize int `json:"recommended_tensor_parallel_size,omitempty"`
 }
 
 // CheckInferenceFit answers whether a model, at a context length, runs on a GPU

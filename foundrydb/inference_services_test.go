@@ -439,8 +439,10 @@ func TestCheckInferenceFit_WireFormat(t *testing.T) {
 		"suggestions": [
 			{"kind":"reduce_context","detail":"Serve at 16384 tokens of context on this plan.","max_model_len":16384},
 			{"kind":"fp8_kv_cache","detail":"Halve the KV cache with an fp8 cache dtype."},
-			{"kind":"larger_plan","detail":"Move to gpu-h100-1.","plan_name":"gpu-h100-1"}
-		]
+			{"kind":"larger_plan","detail":"Move to gpu-h100-2.","plan_name":"gpu-h100-2","tensor_parallel_size":2}
+		],
+		"recommended_plan": "gpu-h100-2",
+		"recommended_tensor_parallel_size": 2
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -495,8 +497,19 @@ func TestCheckInferenceFit_WireFormat(t *testing.T) {
 	if res.Suggestions[0].Kind != InferenceFitSuggestionReduceContext || res.Suggestions[0].MaxModelLen != 16384 {
 		t.Errorf("reduce_context suggestion: got %+v", res.Suggestions[0])
 	}
-	if res.Suggestions[2].Kind != InferenceFitSuggestionLargerPlan || res.Suggestions[2].PlanName != "gpu-h100-1" {
+	if res.Suggestions[2].Kind != InferenceFitSuggestionLargerPlan || res.Suggestions[2].PlanName != "gpu-h100-2" {
 		t.Errorf("larger_plan suggestion: got %+v", res.Suggestions[2])
+	}
+	if res.Suggestions[2].TensorParallelSize != 2 {
+		t.Errorf("larger_plan suggestion tensor_parallel_size: got %d", res.Suggestions[2].TensorParallelSize)
+	}
+	// The smallest fitting plan is answered whether or not the plan asked about
+	// fits, so a create flow can default to it.
+	if res.RecommendedPlan != "gpu-h100-2" {
+		t.Errorf("recommended_plan: got %q", res.RecommendedPlan)
+	}
+	if res.RecommendedTensorParallelSize != 2 {
+		t.Errorf("recommended_tensor_parallel_size: got %d", res.RecommendedTensorParallelSize)
 	}
 }
 
