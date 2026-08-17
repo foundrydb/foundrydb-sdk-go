@@ -223,6 +223,90 @@ jsonBytes, err := client.DownloadComplianceReportJSON(ctx, orgID, report.ReportI
 pdfBytes, err := client.DownloadComplianceReportPDF(ctx, orgID, report.ReportID)
 ```
 
+### Inference Services
+
+A managed inference service is an open-weight LLM served by vLLM behind an OpenAI-compatible endpoint on the service's own hostname. There are two SKUs: `serverless` multiplexes onto a platform-owned shared GPU pool, takes no plan, is limited to curated models a pool already serves, and is billed per token; `dedicated` rents a whole-card GPU server, takes a GPU plan, serves curated or Hugging Face models, supports LoRA adapters and keep-warm, and is billed per GPU-hour.
+
+Either way the customer calls `EndpointBaseURL` with an `fdb-inf` key, passing `foundrydb_managed/<served_model_name>` as the model.
+
+#### `ListInferenceServices(ctx) ([]InferenceService, error)`
+
+Returns the inference services visible to the authenticated user.
+
+#### `GetInferenceService(ctx, id string) (*InferenceService, error)`
+
+Returns one inference service, or `nil, nil` when it does not exist. While a deploy is in flight, `ProvisioningMessage` carries the live heartbeat.
+
+#### `CreateInferenceService(ctx, InferenceServiceRequest) (*InferenceService, error)`
+
+Provisions an inference service and returns it in the Pending status; poll until it reaches Running and `EndpointBaseURL` is set. A GPU `PlanName` creates a dedicated service; omitting it (or setting `InferenceSKU` to `serverless`) binds to the shared pool.
+
+#### `CreateServerlessInferenceService(ctx, name, modelID, orgID string, licenseAccepted bool) (*InferenceService, error)`
+
+Convenience over the above for the serverless SKU, which takes no plan, no zone, and no serving knobs.
+
+#### `DeleteInferenceService(ctx, id string) error`
+
+Tears the service down. A 404 is treated as success.
+
+#### `ListServerlessInferenceModels(ctx) ([]ServerlessInferenceModel, error)`
+
+Returns the curated models a serverless create can bind to right now. Ask this before a serverless create, which refuses any other model.
+
+#### `ListInferenceModelRates(ctx) ([]InferenceModelRate, error)`
+
+Returns the price in force right now for every priced curated model, so a create flow can quote before anyone commits. It is the same resolution the metering path uses.
+
+#### `SwitchInferenceModel(ctx, id string, InferenceModelSwitchRequest) (*InferenceService, error)`
+
+Changes which curated model an existing service serves, in place. The GPU server, plan, endpoint hostname, certificate, keys, and billing identity are unchanged.
+
+#### `CheckInferenceFit(ctx, InferenceFitCheckRequest) (*InferenceFitCheckResult, error)`
+
+Answers whether a model, at a context length, runs on a GPU plan, without provisioning or billing anything. A configuration that does not fit is still a successful call, and `Suggestions` names the closest fixes.
+
+#### `GetInferenceServiceUsage(ctx, id, since string) (*InferenceServiceUsage, error)`
+
+Returns metered usage and cost as a bucketed series with totals, plus the calendar-month-to-date rollup. `since` is a Go duration or an RFC 3339 start time; empty defaults to 24 hours.
+
+#### `GetInferenceServiceMetrics(ctx, id, since string) (*InferenceServiceMetrics, error)`
+
+Returns the live vLLM and GPU serving telemetry as a snapshot series with the newest reading broken out as `Latest`. `since` defaults to 30 minutes.
+
+#### LoRA adapters
+
+`RegisterInferenceAdapter`, `ListInferenceServiceAdapters`, `PromoteInferenceAdapter`, `DemoteInferenceAdapter`, and `DeleteInferenceAdapter` manage customer LoRA fine-tuned adapter versions in the serving registry. Promoting downloads the weights from Files, verifies their hash, and hot-loads them into vLLM with no restart; rollback is a promote of a prior version.
+
+```go
+// Quote, then create a serverless service on a model a pool already serves
+models, err := client.ListServerlessInferenceModels(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+rates, err := client.ListInferenceModelRates(ctx)
+
+svc, err := client.CreateServerlessInferenceService(ctx, "my-llm", models[0].ModelID, orgID, true)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Or check a dedicated configuration before committing a GPU to it
+fit, err := client.CheckInferenceFit(ctx, foundrydb.InferenceFitCheckRequest{
+    ModelSource: foundrydb.InferenceModelSourceCurated,
+    ModelID:     "llama-3.1-70b-instruct",
+    PlanName:    "gpu-l40s-1",
+    MaxModelLen: 32768,
+})
+if !fit.Fits {
+    for _, s := range fit.Suggestions {
+        fmt.Println(s.Detail)
+    }
+}
+
+fmt.Printf("Point your OpenAI SDK at %s\n", svc.EndpointBaseURL)
+_ = rates
+```
+
 ## Error Handling
 
 All methods return a typed `*foundrydb.APIError` on non-2xx API responses. Use the helper functions to check specific conditions:
