@@ -45,16 +45,19 @@ type UpsertInferenceProviderRequest struct {
 // InferenceKey is the API view of a data-plane key. The secret is never
 // returned after creation; KeyPrefix identifies the key in customer code.
 type InferenceKey struct {
-	ID                string  `json:"id"`
-	Name              string  `json:"name"`
-	KeyPrefix         string  `json:"key_prefix"`
-	MonthlyTokenLimit int64   `json:"monthly_token_limit"`
-	RateLimitRPM      int     `json:"rate_limit_rpm"`
-	Status            string  `json:"status"`
-	TokensUsedCycle   int64   `json:"tokens_used_cycle"`
-	CycleMonth        string  `json:"cycle_month"`
-	CreatedAt         string  `json:"created_at"`
-	RevokedAt         *string `json:"revoked_at,omitempty"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	KeyPrefix         string `json:"key_prefix"`
+	MonthlyTokenLimit int64  `json:"monthly_token_limit"`
+	RateLimitRPM      int    `json:"rate_limit_rpm"`
+	Status            string `json:"status"`
+	TokensUsedCycle   int64  `json:"tokens_used_cycle"`
+	CycleMonth        string `json:"cycle_month"`
+	// ServiceID is the one inference service this key may call, or nil for an
+	// org-scoped key usable against any of the organization's inference services.
+	ServiceID *string `json:"service_id,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	RevokedAt *string `json:"revoked_at,omitempty"`
 }
 
 // CreateInferenceKeyRequest mints a new data-plane key. MonthlyTokenLimit is
@@ -62,7 +65,16 @@ type InferenceKey struct {
 type CreateInferenceKeyRequest struct {
 	Name              string `json:"name"`
 	MonthlyTokenLimit int64  `json:"monthly_token_limit"`
-	RateLimitRPM      *int   `json:"rate_limit_rpm,omitempty"`
+	// RateLimitRPM caps how many requests per minute this key may make. It must
+	// be greater than zero when set; nil takes the platform default. It is the
+	// per-key throttle, not org-wide fairness, so several keys in one
+	// organization each carry their own budget.
+	RateLimitRPM *int `json:"rate_limit_rpm,omitempty"`
+	// ServiceID optionally scopes the key to one inference service the
+	// organization owns, so the credential reaches that endpoint and no other.
+	// Omitted mints an org-scoped key, usable against any of the organization's
+	// inference services.
+	ServiceID *string `json:"service_id,omitempty"`
 }
 
 // CreateInferenceKeyResult carries the one-time secret alongside the key.
@@ -70,6 +82,13 @@ type CreateInferenceKeyRequest struct {
 type CreateInferenceKeyResult struct {
 	Key    InferenceKey `json:"key"`
 	Secret string       `json:"secret"`
+	// ActivationNote states when the secret starts working at the inference
+	// endpoint. The key hash reaches the data plane through an edge config
+	// reconcile that the mint requests immediately, so a request sent in the
+	// same breath as the mint can still answer invalid_key and should be
+	// retried shortly. It is advisory text rather than a status field because
+	// the control plane cannot confirm per-node application at mint time.
+	ActivationNote string `json:"activation_note"`
 }
 
 // OrgInferenceSettings holds org-wide proxy policy: EU-only routing and the
@@ -104,12 +123,39 @@ type InferenceUsageRow struct {
 	CostMicrocents int64  `json:"cost_microcents"`
 }
 
+// OrgInferenceFreeTierStatus is an organization's monthly free token allowance
+// for platform-served (foundrydb_managed) inference, as it stands now. Tokens
+// inside the allowance are metered exactly like paid tokens but recorded at zero
+// cost, so the allowance is consumed before any billing starts.
+//
+// Only platform-served token calls draw on it. A call to the organization's own
+// third-party provider is billed on that provider's account and costs the
+// platform nothing, and an image generation is priced per image and reports no
+// tokens, so neither consumes the allowance.
+type OrgInferenceFreeTierStatus struct {
+	// CycleMonth is the first instant of the calendar month this standing
+	// describes. The allowance resets at each month boundary.
+	CycleMonth string `json:"cycle_month"`
+	// MonthlyTokens is the allowance for the month: the platform default unless
+	// an administrator set an override for this organization.
+	MonthlyTokens int64 `json:"monthly_tokens"`
+	// TokensUsed and TokensRemaining are the allowance drawn down and left,
+	// which is what "X of Y free tokens used" is rendered from.
+	TokensUsed      int64 `json:"tokens_used"`
+	TokensRemaining int64 `json:"tokens_remaining"`
+}
+
 // InferenceUsageSummary wraps aggregated inference usage for an organization.
 type InferenceUsageSummary struct {
 	From    string              `json:"from"`
 	To      string              `json:"to"`
 	GroupBy string              `json:"group_by"`
 	Rows    []InferenceUsageRow `json:"rows"`
+	// FreeTier is the organization's free allowance standing. It always
+	// describes the current calendar month regardless of the queried window,
+	// because the allowance is a monthly meter and not an aggregate of the
+	// window. Nil when the standing could not be read; the rows still answer.
+	FreeTier *OrgInferenceFreeTierStatus `json:"free_tier,omitempty"`
 }
 
 // InferenceUsageOptions filters GetInferenceUsage. From and To are RFC 3339
@@ -199,7 +245,9 @@ func (c *Client) ListInferenceKeys(ctx context.Context, orgID string) ([]Inferen
 }
 
 // CreateInferenceKey mints a new data-plane key. The returned Secret is shown
-// exactly once; store it immediately, it cannot be retrieved again.
+// exactly once; store it immediately, it cannot be retrieved again. The key does
+// not take effect at the inference endpoint the instant it is minted: see
+// CreateInferenceKeyResult.ActivationNote before calling with it.
 func (c *Client) CreateInferenceKey(ctx context.Context, orgID string, req CreateInferenceKeyRequest) (*CreateInferenceKeyResult, error) {
 	resp, err := c.do(ctx, http.MethodPost, orgInferencePath(orgID)+"/keys", req, orgID)
 	if err != nil {
